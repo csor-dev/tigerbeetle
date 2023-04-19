@@ -20,7 +20,7 @@ const Command = vsr.Command;
 const Version = vsr.Version;
 const VSRState = vsr.VSRState;
 
-const log = stdx.log.scoped(.replica);
+const log = std.log.scoped(.replica);
 const tracer = @import("../tracer.zig");
 
 pub const Status = enum {
@@ -98,11 +98,16 @@ pub fn ReplicaType(
         /// Invariant: node_count = replica_count + standby_count
         node_count: u8,
 
-        /// The index of this replica's address in the configuration array held by the MessageBus.
+        /// Logical index of this replica in the current epoch.
         /// If replica >= replica_count, this is a standby.
         ///
         /// Invariant: replica < node_count
         replica: u8,
+        /// Globally unique identifier of this replica.
+        replica_id: u128,
+
+        /// Replicas participating in the current epoch.
+        members: [constants.nodes_max]u128,
 
         /// The minimum number of replicas required to form a replication quorum:
         quorum_replication: u8,
@@ -126,8 +131,10 @@ pub fn ReplicaType(
         client_replies: ClientReplies,
 
         /// An abstraction to send messages from the replica to another replica or client.
-        /// The message bus will also deliver messages to this replica by calling `on_message_from_bus()`.
+        /// The message bus will also deliver messages to this replica by calling `message_bus_on_message()`.
         message_bus: MessageBus,
+        /// Maps replica indentities to logical indexes used by the MessageBus.
+        message_bus_members: [constants.nodes_max]u128,
 
         /// For executing service up-calls after an operation has been committed:
         state_machine: StateMachine,
@@ -152,6 +159,25 @@ pub fn ReplicaType(
         /// * `replica.view ≥ replica.view_durable`
         /// * `replica.view = 0` when replica_count=1.
         view: u32,
+
+        /// Current epoch.
+        /// The set of active replicas is constant throughout epoch and changes across epoch
+        epoch: u32,
+        /// True when the primary accepted, but not yet comitted a reconfiguration request.
+        epoch_pending: bool,
+        /// Data about the previous epoch, if reconfiguration is in progress.
+        epoch_old: ?struct {
+            /// Header for the prepare that concluded the epoch.
+            final_prepare: Header = null,
+            /// Replica index in the previous epoch
+            /// NB: replica can be a standby in one epoch and active in another.
+            replica: u8,
+            /// Replicas participating in the previous epoch.
+            members: [constants.nodes_max]u128,
+            /// This is epoch-1, but we redundantly store it to get extra asserts
+            /// via .?.
+            epoch: u32,
+        },
 
         /// The latest view where
         /// - the replica was a primary and acquired a DVC quorum, or
@@ -286,6 +312,9 @@ pub fn ReplicaType(
         /// This improves liveness when prepare messages cannot be replicated fully due to partitions.
         /// (status=normal primary)
         commit_message_timeout: Timeout,
+
+        /// The number of ticks before a replica in an epoch being retired broadcasts `.end_epoch`.
+        end_epoch_message_timeout: Timeout,
 
         /// The number of ticks without a heartbeat.
         /// Reset any time the backup receives a heartbeat from the primary.
@@ -668,7 +697,8 @@ pub fn ReplicaType(
                 options.cluster,
                 .{ .replica = options.replica_index },
                 options.message_pool,
-                Self.on_message_from_bus,
+                Self.message_bus_on_message,
+                Self.message_bus_resolve_replica,
                 options.message_bus_options,
             );
             errdefer self.message_bus.deinit(allocator);
@@ -690,6 +720,8 @@ pub fn ReplicaType(
                 .standby_count = standby_count,
                 .node_count = node_count,
                 .replica = replica_index,
+                .replica_id = self.superblock.working.vsr_state.replica_id,
+                .members = self.superblock.working.vsr_state.members,
                 .quorum_replication = quorum_replication,
                 .quorum_view_change = quorum_view_change,
                 .quorum_nack_prepare = quorum_nack_prepare,
@@ -700,11 +732,15 @@ pub fn ReplicaType(
                 .journal = self.journal,
                 .client_replies = client_replies,
                 .message_bus = self.message_bus,
+                .message_bus_members = self.superblock.working.vsr_state.members,
                 .state_machine = self.state_machine,
                 .superblock = self.superblock,
                 .grid = self.grid,
                 .opened = self.opened,
                 .view = self.superblock.working.vsr_state.view,
+                .epoch = self.superblock.working.vsr_state.epoch,
+                .epoch_old = null,
+                .epoch_pending = false,
                 .log_view = self.superblock.working.vsr_state.log_view,
                 .op = undefined,
                 .commit_min = self.superblock.working.vsr_state.commit_min,
@@ -733,6 +769,11 @@ pub fn ReplicaType(
                     .name = "commit_message_timeout",
                     .id = replica_index,
                     .after = 50,
+                },
+                .end_epoch_message_timeout = Timeout{
+                    .name = "end_epoch_message_timeout",
+                    .id = replica_index,
+                    .after = 400,
                 },
                 .normal_heartbeat_timeout = Timeout{
                     .name = "normal_heartbeat_timeout",
@@ -848,6 +889,7 @@ pub fn ReplicaType(
             self.prepare_timeout.tick();
             self.primary_abdicate_timeout.tick();
             self.commit_message_timeout.tick();
+            self.end_epoch_message_timeout.tick();
             self.normal_heartbeat_timeout.tick();
             self.start_view_change_window_timeout.tick();
             self.start_view_change_message_timeout.tick();
@@ -860,6 +902,7 @@ pub fn ReplicaType(
             if (self.prepare_timeout.fired()) self.on_prepare_timeout();
             if (self.primary_abdicate_timeout.fired()) self.on_primary_abdicate_timeout();
             if (self.commit_message_timeout.fired()) self.on_commit_message_timeout();
+            if (self.end_epoch_message_timeout.fired()) self.on_end_epoch_message_timeout();
             if (self.normal_heartbeat_timeout.fired()) self.on_normal_heartbeat_timeout();
             if (self.start_view_change_window_timeout.fired()) self.on_start_view_change_window_timeout();
             if (self.start_view_change_message_timeout.fired()) self.on_start_view_change_message_timeout();
@@ -872,8 +915,17 @@ pub fn ReplicaType(
             assert(self.loopback_queue == null);
         }
 
+        fn message_bus_resolve_replica(message_bus: *MessageBus, header: *const Header) ?u8 {
+            const self = @fieldParentPtr(Self, "message_bus", message_bus);
+            if (header.epoch == self.epoch or self.epoch_old != null and header.epoch == self.epoch_old.?.epoch) {
+                const id = self.index_to_id(header.epoch, header.replica);
+                return self.id_to_message_bus_index(id);
+            }
+            return null;
+        }
+
         /// Called by the MessageBus to deliver a message to the replica.
-        fn on_message_from_bus(message_bus: *MessageBus, message: *Message) void {
+        fn message_bus_on_message(message_bus: *MessageBus, message: *Message) void {
             const self = @fieldParentPtr(Self, "message_bus", message_bus);
             self.on_message(message);
         }
@@ -911,6 +963,16 @@ pub fn ReplicaType(
                 return;
             }
 
+            if (self.ignore_message_different_epoch(message.header)) {
+                log.debug("{}: on_message: different epoch (epoch={} message.command={s} message.epoch={})", .{
+                    self.replica,
+                    self.epoch,
+                    @tagName(message.header.command),
+                    message.header.epoch,
+                });
+                return;
+            }
+
             self.view_jump(message.header);
 
             assert(message.header.replica < self.node_count);
@@ -926,6 +988,7 @@ pub fn ReplicaType(
                 .start_view_change => self.on_start_view_change(message),
                 .do_view_change => self.on_do_view_change(message),
                 .start_view => self.on_start_view(message),
+                .end_epoch => self.on_end_epoch(message),
                 .request_start_view => self.on_request_start_view(message),
                 .request_prepare => self.on_request_prepare(message),
                 .request_headers => self.on_request_headers(message),
@@ -959,6 +1022,8 @@ pub fn ReplicaType(
         /// Pings are used by replicas to synchronise cluster time and to probe for network connectivity.
         fn on_ping(self: *Self, message: *const Message) void {
             assert(message.header.command == .ping);
+            assert(message.header.epoch == self.epoch);
+
             if (self.status != .normal and self.status != .view_change) return;
 
             assert(self.status == .normal or self.status == .view_change);
@@ -977,11 +1042,14 @@ pub fn ReplicaType(
                 // Copy the ping's monotonic timestamp to our pong and add our wall clock sample:
                 .op = message.header.op,
                 .timestamp = @bitCast(u64, self.clock.realtime()),
+                .epoch = self.epoch,
             });
         }
 
         fn on_pong(self: *Self, message: *const Message) void {
             assert(message.header.command == .pong);
+            assert(message.header.epoch == self.epoch);
+
             if (message.header.replica == self.replica) {
                 log.warn("{}: on_pong: misdirected message (self)", .{self.replica});
                 return;
@@ -989,6 +1057,9 @@ pub fn ReplicaType(
 
             // Ignore clocks of standbys.
             if (message.header.replica >= self.replica_count) return;
+
+            // FIXME: stable order for pings.
+            if (message.header.replica == self.clock.replica) return;
 
             const m0 = message.header.op;
             const t1 = @bitCast(i64, message.header.timestamp);
@@ -1000,6 +1071,7 @@ pub fn ReplicaType(
         /// Pings are used by clients to learn about the current view.
         fn on_ping_client(self: *Self, message: *const Message) void {
             assert(message.header.command == .ping_client);
+            maybe(message.header.epoch != self.epoch);
             assert(message.header.client != 0);
 
             if (self.ignore_ping_client(message)) return;
@@ -1008,6 +1080,7 @@ pub fn ReplicaType(
                 .command = .pong_client,
                 .cluster = self.cluster,
                 .replica = self.replica,
+                .epoch = self.epoch,
                 .view = self.view,
             });
         }
@@ -1022,18 +1095,21 @@ pub fn ReplicaType(
         ///   The request is queued, and will be dequeued & prepared when the pipeline head commits.
         /// Otherwise, drop the request.
         fn on_request(self: *Self, message: *Message) void {
+            assert(message.header.command == .request);
+            maybe(message.header.epoch != self.epoch);
             if (self.ignore_request_message(message)) return;
 
             assert(self.status == .normal);
             assert(self.primary());
+            assert(!self.epoch_pending);
             assert(self.commit_min == self.commit_max);
             assert(self.commit_max + self.pipeline.queue.prepare_queue.count == self.op);
 
             assert(message.header.command == .request);
-            assert(message.header.view <= self.view); // The client's view may be behind ours.
+            assert(vsr.view_order_or_eql(message.header, self)); // The client's view may be behind ours.
 
             const realtime = self.clock.realtime_synchronized() orelse {
-                log.err("{}: on_request: dropping (clock not synchronized)", .{self.replica});
+                // log.err("{}: on_request: dropping (clock not synchronized)", .{self.replica});
                 return;
             };
 
@@ -1054,7 +1130,7 @@ pub fn ReplicaType(
         /// The primary starts by sending a prepare message to itself.
         ///
         /// Each replica (including the primary) then forwards this prepare message to the next
-        /// replica in the configuration, in parallel to writing to its own journal, closing the
+        /// replica in the members, in parallel to writing to its own journal, closing the
         /// circle until the next replica is back to the primary, in which case the replica does not
         /// forward.
         ///
@@ -1076,6 +1152,8 @@ pub fn ReplicaType(
         /// and the primary will resend but to another replica, until it receives enough prepare_ok's.
         fn on_prepare(self: *Self, message: *Message) void {
             assert(message.header.command == .prepare);
+            maybe(message.header.epoch == self.epoch or
+                message.header.epoch == self.epoch_old.?.epoch);
             assert(message.header.replica < self.replica_count);
 
             if (self.is_repair(message)) {
@@ -1102,6 +1180,7 @@ pub fn ReplicaType(
             assert(self.status == .normal);
             assert(message.header.view == self.view);
             assert(self.primary() or self.backup());
+            // FIXME: epoch
             assert(message.header.replica == self.primary_index(message.header.view));
             assert(message.header.op > self.op_checkpoint());
             assert(message.header.op > self.op);
@@ -1160,6 +1239,7 @@ pub fn ReplicaType(
 
         fn on_prepare_ok(self: *Self, message: *Message) void {
             assert(message.header.command == .prepare_ok);
+            assert(message.header.epoch == self.epoch);
             if (self.ignore_prepare_ok(message)) return;
 
             assert(self.status == .normal);
@@ -1277,6 +1357,7 @@ pub fn ReplicaType(
         /// primary as down, but neither can the primary hear from the backups.
         fn on_commit(self: *Self, message: *const Message) void {
             assert(message.header.command == .commit);
+            assert(message.header.epoch == self.epoch);
             assert(message.header.replica < self.replica_count);
 
             if (self.status != .normal) {
@@ -1368,6 +1449,11 @@ pub fn ReplicaType(
             assert(self.repairs_allowed());
             assert(message.header.view <= self.view);
             assert(message.header.op <= self.op); // Repairs may never advance `self.op`.
+            if (message.header.operation == .reconfigure) {
+                assert(message.header.epoch <= self.epoch);
+                // .reconfigure is always the last op in an epoch.
+                if (message.header.epoch == self.epoch) assert(message.header.op == self.op);
+            }
 
             if (self.journal.has_clean(message.header)) {
                 log.debug("{}: on_repair: ignoring (duplicate)", .{self.replica});
@@ -1387,6 +1473,7 @@ pub fn ReplicaType(
 
         fn on_start_view_change(self: *Self, message: *Message) void {
             assert(message.header.command == .start_view_change);
+            assert(message.header.epoch == self.epoch);
             if (self.ignore_start_view_change_message(message)) return;
 
             assert(!self.solo());
@@ -1444,6 +1531,7 @@ pub fn ReplicaType(
         /// that new view in view-change status and begins to broadcast its own DVC.
         fn on_do_view_change(self: *Self, message: *Message) void {
             assert(message.header.command == .do_view_change);
+            assert(message.header.epoch == self.epoch);
             if (self.ignore_view_change_message(message)) return;
 
             assert(!self.solo());
@@ -1671,7 +1759,7 @@ pub fn ReplicaType(
 
             if (self.status != .normal) {
                 self.view_headers.replace(.start_view, view_headers.slice);
-                assert(self.view_headers.array.get(0).view <= self.view);
+                assert(vsr.view_order_or_eql(self.view_headers.array.get(0), self));
                 assert(self.view_headers.array.get(0).op == message.header.op);
                 maybe(self.view_headers.array.get(0).op > self.op_checkpoint_trigger());
                 assert(self.view_headers.array.get(self.view_headers.array.len - 1).op <=
@@ -1700,8 +1788,25 @@ pub fn ReplicaType(
             self.repair();
         }
 
+        fn on_end_epoch(self: *Self, message: *const Message) void {
+            assert(message.header.command == .end_epoch);
+            assert(message.header.epoch == self.epoch);
+            assert(self.status == .normal or self.status == .view_change or self.status == .recovering_head);
+
+            const headers = message_body_as_headers(message);
+            assert(headers.len == 1);
+            const header_head = headers[0];
+
+            self.set_op_and_commit_max(header_head.op, header_head.op, "on_end_epoch");
+            self.replace_header(&header_head);
+
+            assert(self.op == header_head.op);
+            assert(self.journal.header_with_op(self.op) != null);
+        }
+
         fn on_request_start_view(self: *Self, message: *const Message) void {
             assert(message.header.command == .request_start_view);
+            assert(message.header.epoch == self.epoch);
             if (self.ignore_repair_message(message)) return;
 
             assert(self.status == .normal);
@@ -1733,12 +1838,14 @@ pub fn ReplicaType(
         /// to restore durability.
         fn on_request_prepare(self: *Self, message: *const Message) void {
             assert(message.header.command == .request_prepare);
+            assert(message.header.epoch == self.epoch or message.header.epoch == self.epoch_old.?.epoch);
             if (self.ignore_repair_message(message)) return;
 
             assert(self.node_count > 1);
             maybe(self.status == .recovering_head);
             maybe(message.header.view != self.view);
-            assert(message.header.replica != self.replica);
+
+            assert(message.header.replica != self.replica_epoch(message.header.epoch));
 
             const op = message.header.op;
             const slot = self.journal.slot_for_op(op);
@@ -1753,7 +1860,7 @@ pub fn ReplicaType(
                     op,
                     checksum,
                 });
-                self.send_message_to_replica(message.header.replica, prepare);
+                self.send_message_to_replica_epoch(message.header.epoch, message.header.replica, prepare);
                 return;
             }
 
@@ -1804,9 +1911,11 @@ pub fn ReplicaType(
 
         fn on_request_headers(self: *Self, message: *const Message) void {
             assert(message.header.command == .request_headers);
+            assert(message.header.epoch == self.epoch);
             if (self.ignore_repair_message(message)) return;
 
             maybe(self.status == .recovering_head);
+            assert(message.header.epoch == self.epoch);
             maybe(message.header.view == self.view);
             assert(message.header.replica != self.replica);
 
@@ -1820,6 +1929,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
             };
 
             const op_min = message.header.commit;
@@ -1928,9 +2038,14 @@ pub fn ReplicaType(
 
         fn on_headers(self: *Self, message: *const Message) void {
             assert(message.header.command == .headers);
+            assert(message.header.epoch == self.epoch or
+                message.header.epoch == self.epoch_old.?.epoch);
             if (self.ignore_repair_message(message)) return;
 
             assert(self.status == .normal or self.status == .view_change);
+            assert(message.header.epoch == self.epoch or
+                // We accept headers from the previous epoch.
+                (self.epoch_old != null and message.header.epoch == self.epoch_old.?.epoch));
             maybe(message.header.view == self.view);
             assert(message.header.replica != self.replica);
 
@@ -1961,6 +2076,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .op = self.clock.monotonic(),
+                .epoch = self.epoch,
             };
 
             self.send_header_to_other_replicas_and_standbys(ping);
@@ -2101,9 +2217,35 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
                 .commit = self.commit_max,
                 .timestamp = self.clock.monotonic(),
             });
+        }
+
+        fn on_end_epoch_message_timeout(self: *Self) void {
+            self.end_epoch_message_timeout.reset();
+
+            assert(self.epoch_old != null);
+            const epoch_old = &self.epoch_old.?;
+            assert(self.commit_max >= epoch_old.final_prepare.op);
+
+            const message = self.message_bus.pool.get_message();
+            defer self.message_bus.unref(message);
+
+            message.header.* = .{
+                .command = .end_epoch,
+                .cluster = self.cluster,
+                .replica = epoch_old.replica,
+                .view = 0,
+                .epoch = epoch_old.epoch,
+                .size = 2 * @sizeOf(Header),
+            };
+            stdx.copy_disjoint(.inexact, u8, message.buffer[@sizeOf(Header)..], std.mem.asBytes(&epoch_old.final_prepare));
+            message.header.set_checksum_body(message.body());
+            message.header.set_checksum();
+
+            self.send_message_to_other_replicas_and_standbys_in_old_epoch(message);
         }
 
         fn on_normal_heartbeat_timeout(self: *Self) void {
@@ -2183,6 +2325,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
             });
         }
 
@@ -2355,21 +2498,23 @@ pub fn ReplicaType(
         ) bool {
             assert(a.command == .prepare);
             assert(b.command == .prepare);
+            assert(a.checksum != b.checksum);
 
-            if (a.view < b.view) {
+            if (vsr.view_order_strict(a, b)) {
                 // We do not assert b.op >= a.op, ops may be reordered during a view change.
                 return true;
-            } else if (a.view > b.view) {
+            } else if (vsr.view_order_strict(b, a)) {
                 // We do not assert b.op <= a.op, ops may be reordered during a view change.
                 return false;
-            } else if (a.op < b.op) {
-                assert(a.view == b.view);
-                return true;
-            } else if (a.op > b.op) {
-                assert(a.view == b.view);
-                return false;
             } else {
-                unreachable;
+                assert(a.epoch == b.epoch and a.view == b.view);
+                if (a.op < b.op) {
+                    return true;
+                } else if (a.op > b.op) {
+                    return false;
+                } else {
+                    unreachable;
+                }
             }
         }
 
@@ -2739,6 +2884,11 @@ pub fn ReplicaType(
                 self.op,
                 self.op_checkpoint(),
             });
+            if (self.epoch_old != null) {
+                // FIXME: Is this correct? I think it is not, we should retire on the first op in
+                // the next wrap, not on the last op in the previous wrap.
+                self.epoch_retire_old();
+            }
             tracer.end(
                 &self.tracer_slot_checkpoint,
                 .checkpoint,
@@ -2897,6 +3047,13 @@ pub fn ReplicaType(
                 } else {
                     self.update_client_table_entry(reply);
                 }
+            }
+
+            if (prepare.header.operation == .reconfigure) {
+                assert(self.op == prepare.header.op);
+                assert(self.op == self.commit_max);
+                assert(self.op == self.commit_min);
+                self.epoch_switch_to_new(prepare);
             }
 
             if (self.primary_index(self.view) == self.replica) {
@@ -3070,11 +3227,19 @@ pub fn ReplicaType(
             assert(self.status == .normal or self.status == .view_change);
             assert((self.status == .normal) == (command == .start_view));
             assert((self.status == .view_change) == (command == .do_view_change));
-            assert(self.view >= self.view_durable());
-            assert(self.log_view >= self.log_view_durable());
-            assert((self.log_view < self.view) == (command == .do_view_change));
-            assert((self.log_view == self.view) == (command == .start_view));
-            assert(self.log_view < self.view or self.replica == self.primary_index(self.view));
+
+            assert(self.epoch >= self.epoch_durable());
+            if (self.epoch == self.epoch_durable()) {
+                assert(self.view >= self.view_durable());
+                assert(self.log_view >= self.log_view_durable());
+                assert((self.log_view < self.view) == (command == .do_view_change));
+                assert((self.log_view == self.view) == (command == .start_view));
+                assert(self.log_view < self.view or self.replica == self.primary_index(self.view));
+            } else {
+                // FIXME: Correct?
+                assert(command == .do_view_change);
+                assert(self.log_view == 0);
+            }
 
             const message = self.message_bus.get_message();
             defer self.message_bus.unref(message);
@@ -3132,6 +3297,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
                 // The latest normal view (as specified in the 2012 paper) is different to the view
                 // number contained in the prepare headers we include in the body. The former shows
                 // how recent a view change the replica participated in, which may be much higher.
@@ -3204,12 +3370,18 @@ pub fn ReplicaType(
 
         /// The caller owns the returned message, if any, which has exactly 1 reference.
         fn create_message_from_header(self: *Self, header: Header) *Message {
-            assert(
-                header.view == self.view or
-                    header.command == .request_start_view or
-                    header.command == .reply or
-                    header.command == .ping or header.command == .pong,
-            );
+            assert(header.epoch == self.epoch or header.epoch == self.epoch_old.?.epoch);
+            if (header.epoch == self.epoch) {
+                assert(header.replica == self.replica);
+                assert(
+                    header.view == self.view or
+                        header.command == .request_start_view or
+                        header.command == .ping or header.command == .pong or header.command.reply,
+                );
+            } else {
+                assert(header.replica == self.epoch_old.?.replica);
+                assert(header.command == .request_headers or header.command == .request_prepare);
+            }
             assert(header.size == @sizeOf(Header));
 
             const message = self.message_bus.pool.get_message();
@@ -3287,6 +3459,39 @@ pub fn ReplicaType(
             assert(self.loopback_queue == null);
         }
 
+        fn ignore_message_different_epoch(self: *const Self, header: *const Header) bool {
+            const from_current_epoch = self.epoch == header.epoch;
+            const from_previous_epoch = self.epoch_old != null and header.epoch == self.epoch_old.?.epoch;
+
+            const accept = switch (header.command) {
+                .ping => from_current_epoch,
+                .pong => from_current_epoch,
+                // Client might not know the current epoch.
+                .ping_client => true,
+                .request => true,
+                // Allow repairs from previous epoch.
+                .prepare => from_current_epoch or from_previous_epoch,
+                .prepare_ok => from_current_epoch,
+                .commit => from_current_epoch,
+                .start_view_change => from_current_epoch,
+                .do_view_change => from_current_epoch,
+                .start_view => from_current_epoch,
+                .end_epoch => from_current_epoch,
+                .request_start_view => from_current_epoch,
+                .request_prepare => from_current_epoch or from_previous_epoch,
+                .request_headers => from_current_epoch or from_previous_epoch,
+                // Allow repairs from previous epoch.
+                .headers => from_current_epoch or from_previous_epoch,
+                // Misdirected messages, would be ignored in on_message
+                .pong_client, .eviction, .reply => true,
+                .request_block => unreachable, // TODO
+                .block => unreachable,
+                .reserved => unreachable,
+            };
+
+            return !accept;
+        }
+
         fn ignore_ping_client(self: *const Self, message: *const Message) bool {
             assert(message.header.command == .ping_client);
             assert(message.header.client != 0);
@@ -3346,12 +3551,20 @@ pub fn ReplicaType(
                 message.header.command == .request_prepare or
                 message.header.command == .request_reply or
                 message.header.command == .headers);
+
+            const command: []const u8 = @tagName(message.header.command);
+
             switch (message.header.command) {
                 .headers => assert(message.header.replica < self.replica_count),
                 else => {},
             }
 
-            const command: []const u8 = @tagName(message.header.command);
+            if (message.header.epoch != self.epoch and message.header.command == .request_start_view) {
+                // Ignore .request_start_view --- view changes do not happen in the old epoch.
+                // We broadcast .end_epoch on the timeout to set the head.
+                log.debug("{}: on_{s}: ignoring (older epoch)", .{ self.replica, command });
+                return false;
+            }
 
             if (message.header.command == .request_headers or
                 message.header.command == .request_prepare or
@@ -3373,6 +3586,7 @@ pub fn ReplicaType(
             {
                 // A replica in a different view can assist WAL repair.
             } else {
+                assert(message.header.epoch == self.epoch);
                 if (message.header.view < self.view) {
                     log.debug("{}: on_{s}: ignoring (older view)", .{ self.replica, command });
                     return true;
@@ -3384,14 +3598,16 @@ pub fn ReplicaType(
                 }
             }
 
-            if (self.ignore_repair_message_during_view_change(message)) return true;
+            if (message.header.epoch == self.epoch and self.ignore_repair_message_during_view_change(message)) {
+                return true;
+            }
 
-            if (message.header.replica == self.replica) {
+            if (message.header.replica == self.replica_epoch(message.header.epoch)) {
                 log.warn("{}: on_{s}: misdirected message (self)", .{ self.replica, command });
                 return true;
             }
 
-            if (self.standby()) {
+            if (self.standby_epoch(message.header.epoch)) {
                 switch (message.header.command) {
                     .headers => {},
                     .request_start_view, .request_headers, .request_prepare, .request_reply => {
@@ -3402,21 +3618,16 @@ pub fn ReplicaType(
                 }
             }
 
-            if (self.primary_index(self.view) != self.replica) {
-                switch (message.header.command) {
-                    // Only the primary may receive these messages:
-                    .request_start_view => {
-                        log.warn("{}: on_{s}: misdirected message (backup)", .{ self.replica, command });
-                        return true;
-                    },
-                    .request_prepare, .headers, .request_headers, .request_reply => {},
-                    else => unreachable,
-                }
+            if (message.header.command == .request_start_view and self.primary_index(self.view) != self.replica) {
+                assert(message.header.epoch == self.epoch);
+                log.warn("{}: on_{s}: misdirected message (backup)", .{ self.replica, command });
+                return true;
             }
             return false;
         }
 
         fn ignore_repair_message_during_view_change(self: *Self, message: *const Message) bool {
+            assert(message.header.epoch == self.epoch);
             if (self.status != .view_change) return false;
 
             const command: []const u8 = @tagName(message.header.command);
@@ -3486,6 +3697,11 @@ pub fn ReplicaType(
             if (self.ignore_request_message_duplicate(message)) return true;
             if (self.ignore_request_message_preparing(message)) return true;
 
+            if (self.epoch_pending) {
+                log.debug("{}: on_request: dropping (reconfiguration)", .{self.replica});
+                return true;
+            }
+
             // Don't accept more requests than will fit in the current checkpoint.
             // (The request's op hasn't been assigned yet, but it will be `self.op + 1`
             // when primary_pipeline_next() converts the request to a prepare.)
@@ -3509,7 +3725,7 @@ pub fn ReplicaType(
 
             assert(message.header.command == .request);
             assert(message.header.client > 0);
-            assert(message.header.view <= self.view); // See ignore_request_message_backup().
+            assert(vsr.view_order_or_eql(message.header, self)); // See ignore_request_message_backup().
             assert(message.header.context == 0 or message.header.operation != .register);
             assert(message.header.request == 0 or message.header.operation != .register);
 
@@ -3668,7 +3884,7 @@ pub fn ReplicaType(
             // The client is aware of a newer view:
             // Even if we think we are the primary, we may be partitioned from the rest of the cluster.
             // We therefore drop the message rather than flood our partition with traffic.
-            if (message.header.view > self.view) {
+            if (vsr.view_order_strict(self, message.header)) {
                 log.debug("{}: on_request: ignoring (newer view)", .{self.replica});
                 return true;
             } else if (self.primary()) {
@@ -3679,12 +3895,11 @@ pub fn ReplicaType(
                 // We do not forward `.register` requests for the sake of `Header.peer_type()`.
                 // This enables the MessageBus to identify client connections on the first message.
                 log.debug("{}: on_request: ignoring (backup, register)", .{self.replica});
-            } else if (message.header.view < self.view) {
+            } else if (vsr.view_order_strict(message.header, self)) {
                 // The client may not know who the primary is, or may be retrying after a primary failure.
                 // We forward to the new primary ahead of any client retry timeout to reduce latency.
                 // Since the client is already connected to all replicas, the client may yet receive the
                 // reply from the new primary directly.
-                log.debug("{}: on_request: forwarding (backup)", .{self.replica});
                 self.send_message_to_replica(self.primary_index(self.view), message);
             } else {
                 assert(message.header.view == self.view);
@@ -3709,7 +3924,7 @@ pub fn ReplicaType(
 
             assert(message.header.command == .request);
             assert(message.header.client > 0);
-            assert(message.header.view <= self.view); // See ignore_request_message_backup().
+            assert(vsr.view_order_or_eql(message.header, self)); // See ignore_request_message_backup().
 
             if (self.pipeline.queue.message_by_client(message.header.client)) |pipeline_message| {
                 assert(pipeline_message.header.client == message.header.client);
@@ -3852,7 +4067,7 @@ pub fn ReplicaType(
             return false;
         }
 
-        /// Returns the index into the configuration of the primary for a given view.
+        /// Returns the index into the members of the primary for a given view.
         pub fn primary_index(self: *const Self, view: u32) u8 {
             return @intCast(u8, @mod(view, self.replica_count));
         }
@@ -3885,8 +4100,19 @@ pub fn ReplicaType(
         /// Standbys follow the cluster without participating in consensus. In particular,
         /// standbys receive and replicate prepares, but never send prepare-oks.
         pub fn standby(self: *const Self) bool {
-            assert(self.replica < self.node_count);
-            return self.replica >= self.replica_count;
+            return self.standby_epoch(self.epoch);
+        }
+
+        fn standby_epoch(self: *const Self, epoch: u32) bool {
+            assert(epoch == self.epoch or epoch == self.epoch_old.?.epoch);
+            return self.replica_epoch(epoch) >= self.replica_count;
+        }
+
+        fn replica_epoch(self: *const Self, epoch: u32) u8 {
+            assert(epoch == self.epoch or epoch == self.epoch_old.?.epoch);
+            const replica = if (epoch == self.epoch) self.replica else self.epoch_old.?.replica;
+            assert(replica < self.node_count);
+            return replica;
         }
 
         /// Advances `op` to where we need to be before `header` can be processed as a prepare.
@@ -4140,6 +4366,12 @@ pub fn ReplicaType(
                 message.header.client,
             });
 
+            if (self.epoch_pending) {
+                log.debug("{}: primary_pipeline_prepare: dropping (reconfiguration)", .{self.replica});
+                // FIXME: Drain request queue.
+                return;
+            }
+
             // Guard against the wall clock going backwards by taking the max with timestamps issued:
             self.state_machine.prepare_timestamp = std.math.max(
                 // The cluster `commit_timestamp` may be ahead of our `prepare_timestamp` because this
@@ -4161,6 +4393,7 @@ pub fn ReplicaType(
             message.header.parent = latest_entry.checksum;
             message.header.context = message.header.checksum;
             message.header.view = self.view;
+            message.header.epoch = self.epoch;
             message.header.op = self.op + 1;
             message.header.commit = self.commit_max;
 
@@ -4310,6 +4543,7 @@ pub fn ReplicaType(
                     .cluster = self.cluster,
                     .replica = self.replica,
                     .view = self.view,
+                    .epoch = self.epoch,
                 });
                 return;
             }
@@ -4341,6 +4575,7 @@ pub fn ReplicaType(
                     .cluster = self.cluster,
                     .replica = self.replica,
                     .view = self.view,
+                    .epoch = self.epoch,
                     .commit = range.op_min,
                     .op = range.op_max,
                 });
@@ -4910,6 +5145,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
                 .op = op,
             };
 
@@ -4973,7 +5209,7 @@ pub fn ReplicaType(
             assert(header.valid_checksum());
             assert(header.invalid() == null);
             assert(header.command == .prepare);
-            assert(header.view <= self.view);
+            assert(header.epoch <= self.epoch or header.epoch == self.epoch and header.view <= self.view);
             assert(header.op <= self.op); // Never advance the op.
             assert(header.op <= self.op_checkpoint_trigger());
 
@@ -4990,7 +5226,7 @@ pub fn ReplicaType(
             if (!self.journal.has(header)) self.journal.set_header_as_dirty(header);
         }
 
-        /// Replicates to the next replica in the configuration (until we get back to the primary):
+        /// Replicates to the next replica in the members (until we get back to the primary):
         /// Replication starts and ends with the primary, we never forward back to the primary.
         /// Does not flood the network with prepares that have already committed.
         /// Replication to standbys works similarly, jumping off the replica just before primary.
@@ -5060,7 +5296,9 @@ pub fn ReplicaType(
                     assert(message.header.replica == replica);
                     // We may have transitioned into a newer view:
                     // However, all messages in the quorum should have the same view.
-                    assert(message.header.view <= self.view);
+                    if (message.header.epoch == self.epoch) {
+                        assert(message.header.view <= self.view);
+                    }
                     if (view) |v| {
                         assert(message.header.view == v);
                     } else {
@@ -5202,6 +5440,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
             };
 
             self.send_header_to_other_replicas(header);
@@ -5262,6 +5501,7 @@ pub fn ReplicaType(
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
+                .epoch = self.epoch,
                 .client = client,
             });
         }
@@ -5299,6 +5539,15 @@ pub fn ReplicaType(
             }
         }
 
+        fn send_message_to_other_replicas_and_standbys_in_old_epoch(self: *Self, message: *Message) void {
+            var replica: u8 = 0;
+            while (replica < self.node_count) : (replica += 1) {
+                if (replica != self.epoch_old.?.replica) {
+                    self.send_message_to_replica(replica, message);
+                }
+            }
+        }
+
         fn send_header_to_replica(self: *Self, replica: u8, header: Header) void {
             const message = self.create_message_from_header(header);
             defer self.message_bus.unref(message);
@@ -5315,7 +5564,35 @@ pub fn ReplicaType(
             }
         }
 
+        fn index_to_id(self: *const Self, epoch: u32, replica: u32) u128 {
+            const members = if (epoch == self.epoch) &self.members else &self.epoch_old.?.members;
+            return members[replica];
+        }
+
+        fn id_to_message_bus_index(self: *const Self, replica_id: u128) u8 {
+            for (self.message_bus_members) |member, index| {
+                if (replica_id == member) return @intCast(u8, index);
+            }
+            unreachable;
+        }
+
         fn send_message_to_replica(self: *Self, replica: u8, message: *Message) void {
+            self.send_message_to_replica_epoch(message.header.epoch, replica);
+        }
+
+        fn send_message_to_replica_epoch(self: *Self, epoch: u8, replica: u8, message: *Message) void {
+            assert(epoch == self.epoch or epoch == self.epoch_old.?.epoch);
+
+            if (epoch != self.epoch) {
+                switch (message.header.command) {
+                    // Repair related messages can be send to and received from an old epoch.
+                    .prepare, .headers, .request_headers, .request_prepare => {},
+                    // .end_epoch can be sent to an old epoch.
+                    .end_epoch => {},
+                    else => unreachable,
+                }
+            }
+
             log.debug("{}: sending {s} to replica {}: {}", .{
                 self.replica,
                 @tagName(message.header.command),
@@ -5329,6 +5606,10 @@ pub fn ReplicaType(
             }
 
             assert(message.header.cluster == self.cluster);
+            assert(message.header.epoch == self.epoch or
+                message.header.epoch == self.epoch - 1 and self.epoch_old != null or message.header.command == .request);
+
+            const replica_id = self.index_to_id(if (message.header.command == .request) self.epoch else message.header.epoch, replica);
 
             // TODO According to message.header.command, assert on the destination replica.
             switch (message.header.command) {
@@ -5337,17 +5618,17 @@ pub fn ReplicaType(
                     assert(!self.standby());
                     // Do not assert message.header.replica because we forward .request messages.
                     assert(self.status == .normal);
-                    assert(message.header.view <= self.view);
+                    assert(vsr.view_order_or_eql(message.header, self));
                 },
                 .prepare => {
                     maybe(self.standby());
                     assert(self.replica != replica);
                     // Do not assert message.header.replica because we forward .prepare messages.
                     switch (self.status) {
-                        .normal => assert(message.header.view <= self.view),
-                        .view_change => assert(message.header.view < self.view),
+                        .normal => assert(vsr.view_order_or_eql(message.header, self)),
+                        .view_change => assert(vsr.view_order_strict(message.header, self)),
                         // These are replies to a request_prepare:
-                        else => assert(message.header.view <= self.view),
+                        else => assert(vsr.view_order_or_eql(message.header, self)),
                     }
                 },
                 .prepare_ok => {
@@ -5395,6 +5676,9 @@ pub fn ReplicaType(
                     assert(message.header.commit == self.commit_min);
                     assert(message.header.commit == self.commit_max);
                     assert(message.header.timestamp == self.op_checkpoint());
+                },
+                .end_epoch => {
+                    // FIXME
                 },
                 .headers => {
                     assert(!self.standby());
@@ -5460,17 +5744,18 @@ pub fn ReplicaType(
                 .block => unreachable,
             }
 
-            if (replica != self.replica) {
+            if (replica_id != self.replica_id and
+                // Pings are used for syncing time, so they must not be
+                // blocked on persisting view.
+                message.header.command != .ping and message.header.command != .pong and
+                message.header.command != .request_start_view)
+            {
                 // Critical: Do not advertise a view/log_view before it is durable.
                 // See view_durable()/log_view_durable().
-                if (message.header.view > self.view_durable() and
-                    message.header.command != .request_start_view)
-                {
-                    // Pings are used for syncing time, so they must not be
-                    // blocked on persisting view.
-                    assert(message.header.command != .ping);
-                    assert(message.header.command != .pong);
-
+                // FIXME: epochs?
+                const view_ahead = message.header.epoch > self.epoch_durable() or
+                    message.header.epoch == self.epoch_durable() and message.header.view > self.view_durable();
+                if (view_ahead) {
                     log.debug("{}: send_message_to_replica: dropped {s} " ++
                         "(view_durable={} message.view={})", .{
                         self.replica,
@@ -5481,13 +5766,15 @@ pub fn ReplicaType(
                     return;
                 }
 
+                const log_view_ahead = message.header.epoch == self.epoch_durable() and self.log_view > self.log_view_durable();
+
                 // For DVCs and SVCs we must wait for the log_view to be durable:
                 // - A DVC includes the log_view.
                 // - A SV implies the log_view.
                 if (message.header.command == .do_view_change or
                     message.header.command == .start_view)
                 {
-                    if (self.log_view_durable() < self.log_view) {
+                    if (log_view_ahead) {
                         log.debug("{}: send_message_to_replica: dropped {s} " ++
                             "(log_view_durable={} log_view={})", .{
                             self.replica,
@@ -5505,11 +5792,14 @@ pub fn ReplicaType(
                 }
             }
 
-            if (replica == self.replica) {
+            if (replica_id == self.replica_id) {
+                // FIXME: Can we loop back to self for old epoch?
                 assert(self.loopback_queue == null);
+                assert(message.header.command != .request);
                 self.loopback_queue = message.ref();
             } else {
-                self.message_bus.send_message_to_replica(replica, message);
+                const message_bus_replica = self.id_to_message_bus_index(replica_id);
+                self.message_bus.send_message_to_replica(message_bus_replica, message);
             }
         }
 
@@ -5576,6 +5866,10 @@ pub fn ReplicaType(
             return self.superblock.working.vsr_state.log_view;
         }
 
+        fn epoch_durable(self: *const Self) u32 {
+            return self.superblock.working.vsr_state.epoch;
+        }
+
         fn view_durable_updating(self: *const Self) bool {
             return self.superblock.view_change_in_progress();
         }
@@ -5586,17 +5880,22 @@ pub fn ReplicaType(
         fn view_durable_update(self: *Self) void {
             assert(self.status == .normal or self.status == .view_change or
                 (self.status == .recovering and self.solo()));
-            assert(self.view >= self.log_view);
-            assert(self.view >= self.view_durable());
-            assert(self.log_view >= self.log_view_durable());
-            assert(self.log_view > self.log_view_durable() or self.view > self.view_durable());
-            // The primary must only persist the SV headers after repairs are done.
-            // Otherwise headers could be nacked, truncated, then restored after a crash.
-            assert(self.log_view < self.view or self.replica != self.primary_index(self.view) or
-                self.status == .normal or self.status == .recovering);
-            assert(self.view_headers.array.len > 0);
-            assert(self.view_headers.array.get(0).view <= self.log_view);
-            assert(self.commit_max >= self.op -| constants.pipeline_prepare_queue_max);
+            assert(self.epoch >= self.epoch_durable());
+            if (self.epoch == self.epoch_durable()) {
+                assert(self.view >= self.log_view);
+                assert(self.view >= self.view_durable());
+                assert(self.log_view >= self.log_view_durable());
+                assert(self.log_view > self.log_view_durable() or self.view > self.view_durable());
+                // The primary must only persist the SV headers after repairs are done.
+                // Otherwise headers could be nacked, truncated, then restored after a crash.
+                assert(self.log_view < self.view or self.replica != self.primary_index(self.view) or
+                    self.status == .normal or self.status == .recovering);
+                assert(self.view_headers.array.len > 0);
+                if (self.view_headers.array.get(0).epoch == self.epoch) {
+                    assert(self.view_headers.array.get(0).view <= self.log_view);
+                }
+                assert(self.commit_max >= self.op -| constants.pipeline_prepare_queue_max);
+            }
 
             if (self.view_durable_updating()) return;
 
@@ -5614,6 +5913,7 @@ pub fn ReplicaType(
                 .{
                     .commit_max = self.commit_max,
                     .view = self.view,
+                    .epoch = self.epoch,
                     .log_view = self.log_view,
                     .headers = &self.view_headers,
                 },
@@ -5626,8 +5926,14 @@ pub fn ReplicaType(
             assert(self.status == .normal or self.status == .view_change or
                 (self.status == .recovering and self.solo()));
             assert(!self.view_durable_updating());
-            assert(self.superblock.working.vsr_state.view <= self.view);
-            assert(self.superblock.working.vsr_state.log_view <= self.log_view);
+            assert(self.superblock.working.vsr_state.epoch <= self.epoch);
+            if (self.superblock.working.vsr_state.epoch == self.epoch) {
+                assert(self.superblock.working.vsr_state.view <= self.view);
+                assert(self.superblock.working.vsr_state.log_view <= self.log_view);
+                assert(self.view_durable() <= self.view);
+                assert(self.log_view_durable() <= self.view_durable());
+                assert(self.log_view_durable() <= self.log_view);
+            }
             assert(self.superblock.working.vsr_state.commit_min <= self.commit_min);
             assert(self.superblock.working.vsr_state.commit_max <= self.commit_max);
 
@@ -5637,10 +5943,6 @@ pub fn ReplicaType(
                 self.view_durable(),
                 self.log_view_durable(),
             });
-
-            assert(self.view_durable() <= self.view);
-            assert(self.log_view_durable() <= self.view_durable());
-            assert(self.log_view_durable() <= self.log_view);
 
             // The view/log_view incremented while the previous view-change update was being saved.
             const update = self.log_view_durable() < self.log_view or
@@ -5967,10 +6269,64 @@ pub fn ReplicaType(
 
             // SVs will be sent out after the view_durable update completes.
             assert(self.view_durable_updating());
-            assert(self.log_view > self.log_view_durable());
+            if (self.epoch == self.epoch_durable()) {
+                assert(self.log_view > self.log_view_durable());
+            }
 
             // Send prepare_ok messages to ourself to contribute to the pipeline.
             self.send_prepare_oks_after_view_change();
+        }
+
+        fn epoch_initiate_new(self: *Self) void {
+            assert(!self.epoch_pending);
+            assert(self.epoch_old == null);
+            assert(self.status == .normal or self.status == .view_change);
+
+            log.err("{}: epoch_initiate_new", .{self.replica});
+            self.epoch_pending = true;
+        }
+
+        fn epoch_switch_to_new(self: *Self, prepare: *const Message) void {
+            assert(self.status == .normal);
+            assert(self.epoch_pending);
+            assert(self.epoch_old == null);
+            assert(!self.end_epoch_message_timeout.ticking);
+
+            const members_new = message_body_as_members(prepare);
+
+            const replica_new = for (members_new) |member, index| {
+                if (member == self.replica_id) break @intCast(u8, index);
+            } else unreachable;
+
+            log.err("{}: epoch_switch_to_new replica_new={}", .{ self.replica, replica_new });
+
+            self.epoch_old = .{
+                .members = self.members,
+                .replica = self.replica,
+                .final_prepare = prepare.header.*,
+                .epoch = self.epoch,
+            };
+            self.members = members_new.*;
+            self.epoch += 1;
+            self.log_view = 0;
+            self.view = 0;
+            self.replica = replica_new;
+            self.epoch_pending = false;
+            self.end_epoch_message_timeout.start();
+
+            self.transition_to_view_change_status(self.view + 1);
+            // assert(self.superblock_context_view_change.vsr_state.?.epoch == self.epoch);
+        }
+
+        fn epoch_retire_old(self: *Self) void {
+            assert(!self.epoch_pending);
+            assert(self.epoch_old != null);
+            assert(self.end_epoch_message_timeout.ticking);
+
+            log.err("{}: epoch_retire_old", .{self.replica});
+
+            self.epoch_old = null;
+            self.end_epoch_message_timeout.stop();
         }
 
         fn transition_to_recovering_head(self: *Self) void {
@@ -6446,6 +6802,7 @@ pub fn ReplicaType(
         }
 
         fn view_jump(self: *Self, header: *const Header) void {
+            if (header.epoch != self.epoch) return;
             if (header.view < self.view) return;
             if (header.replica >= self.replica_count) return; // Ignore messages from standbys.
 
@@ -6507,6 +6864,7 @@ pub fn ReplicaType(
                         .cluster = self.cluster,
                         .replica = self.replica,
                         .view = header.view,
+                        .epoch = header.epoch,
                     });
                 },
                 .view_change => {
@@ -6562,6 +6920,11 @@ pub fn ReplicaType(
             {
                 const prepare_evicted = self.pipeline.cache.insert(message.ref());
                 if (prepare_evicted) |m| self.message_bus.unref(m);
+            }
+
+            if (message.header.operation == .reconfigure and message.header.epoch == self.epoch) {
+                assert(message.header.op == self.op);
+                self.epoch_initiate_new();
             }
 
             self.journal.write_prepare(write_prepare_callback, message, trigger);
@@ -6742,7 +7105,9 @@ const DVCQuorum = struct {
         assert(headers.slice.len >= 1);
         assert(headers.slice.len <= constants.pipeline_prepare_queue_max + 1);
         assert(headers.slice[0].op == message.header.op);
-        assert(headers.slice[0].view <= log_view);
+        if (headers.slice[0].epoch == message.header.epoch) {
+            assert(headers.slice[0].view <= log_view);
+        }
 
         const nacks = message.header.context;
         comptime assert(@TypeOf(nacks) == u128);
@@ -7073,7 +7438,8 @@ fn message_body_as_view_headers(message: *const Message) vsr.Headers.ViewChangeS
 fn message_body_as_headers(message: *const Message) []const Header {
     assert(message.header.size > @sizeOf(Header)); // Body must contain at least one header.
     assert(message.header.command == .start_view or
-        message.header.command == .headers);
+        message.header.command == .headers or
+        message.header.command == .end_epoch);
 
     const headers = message_body_as_headers_unchecked(message);
     var child: ?*const Header = null;
@@ -7081,7 +7447,7 @@ fn message_body_as_headers(message: *const Message) []const Header {
         if (constants.verify) assert(header.valid_checksum());
         assert(header.command == .prepare);
         assert(header.cluster == message.header.cluster);
-        assert(header.view <= message.header.view);
+        assert(vsr.view_order_or_eql(header, message.header) or message.header.command == .end_epoch);
 
         if (child) |child_header| {
             // Headers must be provided in reverse order for the sake of `repair_header()`.
@@ -7098,11 +7464,23 @@ fn message_body_as_headers_unchecked(message: *const Message) []const Header {
     assert(message.header.size > @sizeOf(Header)); // Body must contain at least one header.
     assert(message.header.command == .do_view_change or
         message.header.command == .start_view or
-        message.header.command == .headers);
+        message.header.command == .headers or
+        message.header.command == .end_epoch);
 
     return std.mem.bytesAsSlice(
         Header,
         message.buffer[@sizeOf(Header)..message.header.size],
+    );
+}
+
+fn message_body_as_members(message: *const Message) *const [constants.nodes_max]u128 {
+    assert(message.header.command == .prepare);
+    assert(message.header.operation == .reconfigure);
+    assert(message.header.size == @sizeOf(Header) + @sizeOf([constants.nodes_max]u128));
+
+    return std.mem.bytesAsValue(
+        [constants.nodes_max]u128,
+        message.buffer[@sizeOf(Header)..][0..@sizeOf([constants.nodes_max]u128)],
     );
 }
 

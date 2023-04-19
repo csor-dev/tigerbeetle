@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdx = @import("../stdx.zig");
 const assert = std.debug.assert;
 const log = std.log.scoped(.test_replica);
 const expectEqual = std.testing.expectEqual;
@@ -538,6 +539,56 @@ test "Cluster: view-change: DVC, 2/3 faulty header stall" {
     try expectEqual(t.replica(.R_).status(), .view_change);
 }
 
+test "Cluster: reconfiguration: smoke" {
+    const t = try TestContext.init(.{
+        .replica_count = 3,
+        .standby_count = 3,
+    });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(20, 20);
+    try expectEqual(t.replica(.R_).epoch(), 0);
+    try expectEqual(t.replica(.R_).view(), 1);
+    try expectEqual(t.replica(.R_).commit(), 20);
+    var admin = t.clients(0, 1);
+    try admin.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
+
+    try c.request(30, 31);
+    try expectEqual(t.replica(.R_).epoch(), 1);
+    try expectEqual(t.replica(.R_).view(), 1);
+}
+
+test "Cluster: reconfiguration: replica misses reconfiguration" {
+    const t = try TestContext.init(.{
+        .replica_count = 3,
+        .standby_count = 3,
+    });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(20, 20);
+    try expectEqual(t.replica(.R_).epoch(), 0);
+    try expectEqual(t.replica(.R_).view(), 1);
+    try expectEqual(t.replica(.R_).commit(), 20);
+
+    t.replica(.R0).stop();
+
+    var admin = t.clients(0, 1);
+    try admin.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
+    // try c.request(25, 20);
+
+    try expectEqual(t.replica(.R0).open(), .ok);
+    try expectEqual(t.replica(.R0).epoch(), 0);
+    t.run();
+    t.cluster.log_cluster();
+    try expectEqual(t.replica(.R0).epoch(), 1);
+
+    try c.request(30, 30);
+    try expectEqual(t.replica(.R_).epoch(), 1);
+    try expectEqual(t.replica(.R_).view(), 1);
+}
+
 const ProcessSelector = enum {
     __, // all replicas, standbys, and clients
     R_, // all (non-standby) replicas
@@ -793,6 +844,10 @@ const TestReplicas = struct {
         return t.get(.log_view);
     }
 
+    pub fn epoch(t: *const TestReplicas) u32 {
+        return t.get(.epoch);
+    }
+
     pub fn op_head(t: *const TestReplicas) u64 {
         return t.get(.op);
     }
@@ -968,6 +1023,39 @@ const TestClients = struct {
             }
         }
         try std.testing.expectEqual(t.replies(), expect_replies);
+    }
+
+    pub fn request_reconfigure(t: *TestClients, replicas: []const u8) !void {
+        assert(t.clients.len == 1);
+        assert(replicas.len == t.cluster.replicas.len);
+
+        var configuration = [_]u128{0} ** constants.nodes_max;
+        for (replicas) |index, i| {
+            configuration[i] = t.cluster.replicas[index].replica_id;
+        }
+
+        for (t.clients.constSlice()) |c| {
+            t.context.client_requests[c] += 1;
+            t.requests += 1;
+
+            const client = &t.cluster.clients[c];
+            const message = client.get_message();
+            defer client.unref(message);
+
+            const body_size = @sizeOf([constants.nodes_max]u128);
+            stdx.copy_disjoint(.inexact, u8, message.buffer[@sizeOf(vsr.Header)..], std.mem.asBytes(&configuration));
+            t.cluster.request(c, .reconfigure, message, body_size);
+        }
+
+        const tick_max = 2_000;
+        var tick: usize = 0;
+        while (tick < tick_max) : (tick += 1) {
+            if (t.context.tick()) tick = 0;
+        }
+        for (t.cluster.clients) |*c| {
+            c.message_bus.perm = replicas;
+            c.epoch += 1;
+        }
     }
 
     pub fn replies(t: *const TestClients) usize {
