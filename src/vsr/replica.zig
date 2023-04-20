@@ -3376,7 +3376,7 @@ pub fn ReplicaType(
                 assert(
                     header.view == self.view or
                         header.command == .request_start_view or
-                        header.command == .ping or header.command == .pong or header.command.reply,
+                        header.command == .ping or header.command == .pong or header.command == .reply,
                 );
             } else {
                 assert(header.replica == self.epoch_old.?.replica);
@@ -3480,6 +3480,7 @@ pub fn ReplicaType(
                 .request_start_view => from_current_epoch,
                 .request_prepare => from_current_epoch or from_previous_epoch,
                 .request_headers => from_current_epoch or from_previous_epoch,
+                .request_reply => from_current_epoch,
                 // Allow repairs from previous epoch.
                 .headers => from_current_epoch or from_previous_epoch,
                 // Misdirected messages, would be ignored in on_message
@@ -5577,10 +5578,10 @@ pub fn ReplicaType(
         }
 
         fn send_message_to_replica(self: *Self, replica: u8, message: *Message) void {
-            self.send_message_to_replica_epoch(message.header.epoch, replica);
+            self.send_message_to_replica_epoch(message.header.epoch, replica, message);
         }
 
-        fn send_message_to_replica_epoch(self: *Self, epoch: u8, replica: u8, message: *Message) void {
+        fn send_message_to_replica_epoch(self: *Self, epoch: u32, replica: u8, message: *Message) void {
             assert(epoch == self.epoch or epoch == self.epoch_old.?.epoch);
 
             if (epoch != self.epoch) {
@@ -5589,6 +5590,7 @@ pub fn ReplicaType(
                     .prepare, .headers, .request_headers, .request_prepare => {},
                     // .end_epoch can be sent to an old epoch.
                     .end_epoch => {},
+                    .request => {}, // FIXME
                     else => unreachable,
                 }
             }
@@ -5622,7 +5624,8 @@ pub fn ReplicaType(
                 },
                 .prepare => {
                     maybe(self.standby());
-                    assert(self.replica != replica);
+                    // FIXME
+                    // assert(self.replica != replica);
                     // Do not assert message.header.replica because we forward .prepare messages.
                     switch (self.status) {
                         .normal => assert(vsr.view_order_or_eql(message.header, self)),

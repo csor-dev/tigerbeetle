@@ -576,15 +576,14 @@ test "Cluster: reconfiguration: replica misses reconfiguration" {
 
     var admin = t.clients(0, 1);
     try admin.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
-    // try c.request(25, 20);
+    try c.request(25, 26);
 
     try expectEqual(t.replica(.R0).open(), .ok);
     try expectEqual(t.replica(.R0).epoch(), 0);
     t.run();
-    t.cluster.log_cluster();
     try expectEqual(t.replica(.R0).epoch(), 1);
 
-    try c.request(30, 30);
+    try c.request(30, 31);
     try expectEqual(t.replica(.R_).epoch(), 1);
     try expectEqual(t.replica(.R_).view(), 1);
 }

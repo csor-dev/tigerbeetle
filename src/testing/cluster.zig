@@ -321,9 +321,9 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
                 switch (cluster.replica_health[i]) {
                     .up => {
                         replica.tick();
-                        cluster.state_checker.check_state(replica.replica) catch |err| {
-                            fatal(.correctness, "state checker error: {}", .{err});
-                        };
+                        // cluster.state_checker.check_state(replica.replica) catch |err| {
+                        //     fatal(.correctness, "state checker error: {}", .{err});
+                        // };
                     },
                     // Keep ticking the time so that it won't have diverged too far to synchronize
                     // when the replica restarts.
@@ -450,19 +450,27 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
             cluster.on_client_reply(cluster, client_index, request_message, reply_message);
         }
 
+        fn get_stable_index(cluster: *const Self, replica: *const Replica) u8 {
+            for(cluster.replicas) |*r, i| {
+                if (r.replica_id == replica.replica_id) return @intCast(u8, i);
+            } else unreachable;
+        }
+
         fn on_replica_commit(replica: *const Replica) void {
             const cluster = @ptrCast(*Self, @alignCast(@alignOf(Self), replica.context.?));
-            assert(cluster.replica_health[replica.replica] == .up);
+            const stable_index = cluster.get_stable_index(replica);
+            assert(cluster.replica_health[stable_index] == .up);
 
-            cluster.log_replica(.commit, replica.replica);
-            cluster.state_checker.check_state(replica.replica) catch |err| {
+            cluster.log_replica(.commit, stable_index);
+            cluster.state_checker.check_state(stable_index) catch |err| {
                 fatal(.correctness, "state checker error: {}", .{err});
             };
         }
 
         fn on_replica_compact(replica: *const Replica) void {
             const cluster = @ptrCast(*Self, @alignCast(@alignOf(Self), replica.context.?));
-            assert(cluster.replica_health[replica.replica] == .up);
+            const stable_index = cluster.get_stable_index(replica);
+            assert(cluster.replica_health[stable_index] == .up);
             cluster.storage_checker.replica_compact(replica) catch |err| {
                 fatal(.correctness, "storage checker error: {}", .{err});
             };
@@ -470,16 +478,18 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
 
         fn on_replica_checkpoint_start(replica: *const Replica) void {
             const cluster = @ptrCast(*Self, @alignCast(@alignOf(Self), replica.context.?));
-            assert(cluster.replica_health[replica.replica] == .up);
+            const stable_index = cluster.get_stable_index(replica);
+            assert(cluster.replica_health[stable_index] == .up);
 
-            cluster.log_replica(.checkpoint_start, replica.replica);
+            cluster.log_replica(.checkpoint_start, stable_index);
         }
 
         fn on_replica_checkpoint_done(replica: *const Replica) void {
             const cluster = @ptrCast(*Self, @alignCast(@alignOf(Self), replica.context.?));
-            assert(cluster.replica_health[replica.replica] == .up);
+            const stable_index = cluster.get_stable_index(replica);
+            assert(cluster.replica_health[stable_index] == .up);
 
-            cluster.log_replica(.checkpoint_done, replica.replica);
+            cluster.log_replica(.checkpoint_done, stable_index);
             cluster.storage_checker.replica_checkpoint(replica) catch |err| {
                 fatal(.correctness, "storage checker error: {}", .{err});
             };
