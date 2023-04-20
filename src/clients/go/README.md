@@ -484,6 +484,6 @@ $ git submodule update --init --recursive
 $ .\scripts\install_zig.bat
 $ .\scripts\build.bat go_client -Drelease-safe
 $ cd src\clients\go
-$ if ($env:TEST -q "true") { .\zgo.bat test } else { echo "Skipping client unit test" }
+$ if ($env:TEST -eq "true") { .\zgo.bat test } else { echo "Skipping client unit test" }
 ```
 

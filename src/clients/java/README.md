@@ -564,6 +564,6 @@ $ git submodule update --init --recursive
 $ .\scripts\install_zig.bat
 $ cd src/clients/java
 $ .\scripts\install.bat
-$ if ($env:TEST -q "true") { mvn test } else { echo "Skipping client unit test" }
+$ if ($env:TEST -eq "true") { mvn test } else { echo "Skipping client unit test" }
 ```
 
