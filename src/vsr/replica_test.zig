@@ -20,7 +20,7 @@ const checkpoint_1 = checkpoint_trigger_1 - constants.lsm_batch_multiple;
 const checkpoint_2 = checkpoint_trigger_2 - constants.lsm_batch_multiple;
 const checkpoint_trigger_1 = slot_count - 1;
 const checkpoint_trigger_2 = slot_count + checkpoint_trigger_1 - constants.lsm_batch_multiple;
-const log_level = std.log.Level.err;
+const log_level = std.log.Level.info;
 
 // TODO Test client eviction once it no longer triggers a client panic.
 // TODO Detect when cluster has stabilized and stop run() early, rather than just running for a
@@ -551,12 +551,12 @@ test "Cluster: reconfiguration: smoke" {
     try expectEqual(t.replica(.R_).epoch(), 0);
     try expectEqual(t.replica(.R_).view(), 1);
     try expectEqual(t.replica(.R_).commit(), 20);
-    var admin = t.clients(0, 1);
-    try admin.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
+    try c.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
 
-    try c.request(30, 31);
+    try c.request(30, 30);
     try expectEqual(t.replica(.R_).epoch(), 1);
     try expectEqual(t.replica(.R_).view(), 1);
+    try expectEqual(t.replica(.R_).commit(), 30);
 }
 
 test "Cluster: reconfiguration: replica misses reconfiguration" {
@@ -573,19 +573,48 @@ test "Cluster: reconfiguration: replica misses reconfiguration" {
     try expectEqual(t.replica(.R_).commit(), 20);
 
     t.replica(.R0).stop();
+    try c.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
+    try c.request(25, 25);
 
-    var admin = t.clients(0, 1);
-    try admin.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
-    try c.request(25, 26);
-
-    try expectEqual(t.replica(.R0).open(), .ok);
     try expectEqual(t.replica(.R0).epoch(), 0);
+    try expectEqual(t.replica(.R0).open(), .ok);
     t.run();
     try expectEqual(t.replica(.R0).epoch(), 1);
 
-    try c.request(30, 31);
+    try c.request(30, 30);
     try expectEqual(t.replica(.R_).epoch(), 1);
     try expectEqual(t.replica(.R_).view(), 1);
+}
+
+test "Cluster: reconfiguration: standby misses reconfiguration" {
+    const t = try TestContext.init(.{
+        .replica_count = 3,
+        .standby_count = 3,
+    });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(20, 20);
+    try expectEqual(t.replica(.R_).epoch(), 0);
+    try expectEqual(t.replica(.R_).view(), 1);
+    try expectEqual(t.replica(.R_).commit(), 20);
+
+    t.replica(.S0).stop();
+    try c.request_reconfigure(&.{ 3, 4, 5, 0, 1, 2 });
+    try c.request(25, 25);
+    try expectEqual(t.replica(.R_).epoch(), 1);
+    try expectEqual(t.replica(.R_).view(), 1);
+
+    try expectEqual(t.replica(.S0).epoch(), 0);
+    try expectEqual(t.replica(.S0).open(), .ok);
+    t.run();
+    try expectEqual(t.replica(.S0).epoch(), 1);
+
+    try c.request(30, 30);
+    try expectEqual(t.replica(.R_).epoch(), 1);
+    try expectEqual(t.replica(.R_).view(), 1);
+    try expectEqual(t.replica(.S_).epoch(), 1);
+    try expectEqual(t.replica(.S_).view(), 1);
 }
 
 const ProcessSelector = enum {
@@ -1025,9 +1054,6 @@ const TestClients = struct {
     }
 
     pub fn request_reconfigure(t: *TestClients, replicas: []const u8) !void {
-        assert(t.clients.len == 1);
-        assert(replicas.len == t.cluster.replicas.len);
-
         var configuration = [_]u128{0} ** constants.nodes_max;
         for (replicas) |index, i| {
             configuration[i] = t.cluster.replicas[index].replica_id;
@@ -1044,6 +1070,7 @@ const TestClients = struct {
             const body_size = @sizeOf([constants.nodes_max]u128);
             stdx.copy_disjoint(.inexact, u8, message.buffer[@sizeOf(vsr.Header)..], std.mem.asBytes(&configuration));
             t.cluster.request(c, .reconfigure, message, body_size);
+            break;
         }
 
         const tick_max = 2_000;
