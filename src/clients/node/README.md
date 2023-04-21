@@ -11,7 +11,7 @@ The TigerBeetle client for Node.js.
 ### Prerequisites
 
 Linux >= 5.6 is the only production environment we
-support. But for ease of development we also support macOS.
+support. But for ease of development we also support macOS. Windows is not yet supported.
 * NodeJS >= `14`
 
 ## Setup

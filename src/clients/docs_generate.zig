@@ -495,7 +495,7 @@ const Generator = struct {
         const windowsSupported: []const u8 = if (language.developer_setup_pwsh_commands.len > 0)
             " and Windows"
         else
-            "";
+            ". Windows is not yet supported";
         mw.print(
             \\Linux >= 5.6 is the only production environment we
             \\support. But for ease of development we also support macOS{s}.
