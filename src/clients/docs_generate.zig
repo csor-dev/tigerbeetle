@@ -364,6 +364,12 @@ const Generator = struct {
         try write_shell_newlines_into_single_line(
             &cmd,
             if (builtin.os.tag == .windows)
+                \\Set-StrictMode -Version 3
+                \\$ErrorActionPreference = "Stop"
+                \\$PSDefaultParameterValues['*:ErrorAction']='Stop'
+                \\$LASTEXITCODE = 0
+                \\
+                ++
                 self.language.developer_setup_pwsh_commands
             else
                 self.language.developer_setup_sh_commands,
