@@ -6,6 +6,12 @@ const go = @import("./go/docs.zig").GoDocs;
 const node = @import("./node/docs.zig").NodeDocs;
 const java = @import("./java/docs.zig").JavaDocs;
 const samples = @import("./docs_samples.zig").samples;
+const TmpDir = @import("./shutil.zig").TmpDir;
+const git_root = @import("./shutil.zig").git_root;
+const shell_wrap = @import("./shutil.zig").shell_wrap;
+const run_shell = @import("./shutil.zig").run_shell;
+const run_shell_with_env = @import("./shutil.zig").run_shell_with_env;
+const run_with_tb = @import("./run_with_tb.zig").run_with_tb;
 
 pub const cmd_sep = if (builtin.os.tag == .windows) ";" else "&&";
 
@@ -127,153 +133,60 @@ const MarkdownWriter = struct {
     }
 };
 
-pub fn exec(
-    arena: *std.heap.ArenaAllocator,
-    cmd: []const []const u8,
-) !std.ChildProcess.ExecResult {
-    var res = try std.ChildProcess.exec(.{
-        .allocator = arena.allocator(),
-        .argv = cmd,
-    });
-    switch (res.term) {
-        .Exited => |code| {
-            if (code != 0) {
-                return error.ExecCommandFailed;
-            }
-        },
-
-        else => return error.UnknownCase,
+fn write_shell_newlines_into_single_line(into: *std.ArrayList(u8), from: []const u8) !void {
+    if (from.len == 0) {
+        return;
     }
 
-    return res;
+    var lines = std.mem.split(u8, from, "\n");
+    while (lines.next()) |line| {
+        try into.writer().print("{s} {s} ", .{ line, cmd_sep });
+    }
 }
 
-pub fn run_with_env(
+pub fn prepare_directory_and_integrate(
     arena: *std.heap.ArenaAllocator,
-    cmd: []const []const u8,
-    env: []const []const u8,
+    language: Docs,
+    dir: []const u8,
 ) !void {
-    std.debug.print("Running:", .{});
-    var i: u32 = 0;
-    while (i < env.len) : (i += 2) {
-        std.debug.print(" {s}={s}", .{ env[i], env[i + 1] });
+    var cmd = std.ArrayList(u8).init(arena.allocator());
+    defer cmd.deinit();
+
+    const root = try git_root(arena);
+
+    if (language.current_commit_pre_install_hook) |hook| {
+        try hook(arena, dir, root);
     }
-    for (cmd) |c| {
-        std.debug.print(" {s}", .{c});
-    }
-    std.debug.print("\n", .{});
 
-    var cp = try std.ChildProcess.init(cmd, arena.allocator());
+    // Then run project, within tmp dir
+    try std.os.chdir(dir);
 
-    var env_map = try std.process.getEnvMap(arena.allocator());
-    i = 0;
-    while (i < env.len) : (i += 2) {
-        try env_map.put(env[i], env[i + 1]);
-    }
-    cp.env_map = &env_map;
-
-    var res = try cp.spawnAndWait();
-    switch (res) {
-        .Exited => |code| {
-            if (code != 0) {
-                return error.RunCommandFailed;
-            }
-        },
-
-        else => return error.UnknownCase,
-    }
-}
-
-// Needs to have -e for `sh` otherwise the command might not fail.
-pub fn shell_wrap(arena: *std.heap.ArenaAllocator, cmd: []const u8) ![]const []const u8 {
-    var wrapped = std.ArrayList([]const u8).init(arena.allocator());
-    if (builtin.os.tag == .windows) {
-        try wrapped.append("powershell");
-    } else {
-        try wrapped.append("sh");
-        try wrapped.append("-e");
-    }
-    try wrapped.append("-c");
-    try wrapped.append(cmd);
-    return wrapped.items;
-}
-
-pub fn run_shell_with_env(
-    arena: *std.heap.ArenaAllocator,
-    cmd: []const u8,
-    env: []const []const u8,
-) !void {
-    try run_with_env(
-        arena,
-        try shell_wrap(arena, cmd),
-        env,
+    cmd.clearRetainingCapacity();
+    try write_shell_newlines_into_single_line(
+        &cmd,
+        language.install_commands,
     );
-}
+    // The above commands all end with ` {cmd_sep} `
+    try cmd.appendSlice("echo ok");
+    try run_shell(arena, cmd.items);
 
-pub fn run(
-    arena: *std.heap.ArenaAllocator,
-    cmd: []const []const u8,
-) !void {
-    try run_with_env(arena, cmd, &.{});
-}
+    if (language.current_commit_post_install_hook) |hook| {
+        try hook(arena, dir, root);
 
-pub fn run_shell(
-    arena: *std.heap.ArenaAllocator,
-    cmd: []const u8,
-) !void {
-    try run_shell_with_env(arena, cmd, &.{});
-}
-
-pub const TmpDir = struct {
-    dir: std.testing.TmpDir,
-    path: []const u8,
-
-    pub fn init(arena: *std.heap.ArenaAllocator) !TmpDir {
-        var tmp_dir = std.testing.tmpDir(.{});
-        return TmpDir{
-            .dir = tmp_dir,
-            .path = try tmp_dir.dir.realpathAlloc(arena.allocator(), "."),
-        };
+        // Reset cwd
+        try std.os.chdir(dir);
     }
 
-    pub fn deinit(self: *TmpDir) void {
-        self.dir.cleanup();
-    }
-};
+    cmd.clearRetainingCapacity();
+    try write_shell_newlines_into_single_line(
+        &cmd,
+        language.run_commands,
+    );
 
-pub fn git_root(arena: *std.heap.ArenaAllocator) ![]const u8 {
-    var prefix: []const u8 = "";
-    var tries: i32 = 0;
-    while (tries < 100) {
-        var dir = std.fs.cwd().openDir(
-            try std.fmt.allocPrint(
-                arena.allocator(),
-                "{s}.git",
-                .{prefix},
-            ),
-            .{},
-        ) catch {
-            prefix = try std.fmt.allocPrint(
-                arena.allocator(),
-                "../{s}",
-                .{prefix},
-            );
-            tries += 1;
-            continue;
-        };
+    // The above commands all end with ` {cmd_sep} `
+    try cmd.appendSlice("echo ok");
 
-        // When looking up realpathAlloc, it can't be an empty string.
-        if (prefix.len == 0) {
-            prefix = ".";
-        }
-
-        const path = try std.fs.cwd().realpathAlloc(arena.allocator(), prefix);
-        dir.close();
-        return path;
-    }
-
-    std.debug.print("Failed to find .git root of TigerBeetle repo.\n", .{});
-    return error.CouldNotFindGitRoot;
+    try run_with_tb(arena, try shell_wrap(arena, cmd.items), dir);
 }
 
 const Generator = struct {
@@ -295,17 +208,6 @@ const Generator = struct {
             .language = language,
             .test_file_name = test_file_name,
         };
-    }
-
-    fn write_shell_newlines_into_single_line(into: *std.ArrayList(u8), from: []const u8) !void {
-        if (from.len == 0) {
-            return;
-        }
-
-        var lines = std.mem.split(u8, from, "\n");
-        while (lines.next()) |line| {
-            try into.writer().print("{s} {s} ", .{ line, cmd_sep });
-        }
     }
 
     fn ensure_path(self: Generator, path: []const u8) !void {
@@ -349,17 +251,6 @@ const Generator = struct {
         }
 
         var cmd = std.ArrayList(u8).init(self.arena.allocator());
-        defer cmd.deinit();
-
-        var env = std.ArrayList([]const u8).init(self.arena.allocator());
-        defer env.deinit();
-        try env.appendSlice(&[_][]const u8{
-            "TB_ROOT", try git_root(self.arena),
-        });
-        try env.appendSlice(&[_][]const u8{
-            "SAMPLE_ROOT", tmp_dir.path,
-        });
-
         // First run general setup within already cloned repo
         try write_shell_newlines_into_single_line(
             &cmd,
@@ -374,48 +265,21 @@ const Generator = struct {
             else
                 self.language.developer_setup_sh_commands,
         );
-        try write_shell_newlines_into_single_line(
-            &cmd,
-            self.language.current_commit_pre_install_commands,
-        );
 
         try cmd.appendSlice("echo ok");
-        try run_shell_with_env(
-            self.arena,
-            cmd.items,
-            env.items,
-        );
 
-        // Then run project, within tmp dir
-        try std.os.chdir(tmp_dir.path);
-
-        cmd.clearRetainingCapacity();
-        try write_shell_newlines_into_single_line(
-            &cmd,
-            self.language.install_commands,
-        );
-        try write_shell_newlines_into_single_line(
-            &cmd,
-            self.language.current_commit_post_install_commands,
-        );
-
-        try write_shell_newlines_into_single_line(
-            &cmd,
-            self.language.build_commands,
-        );
-
-        // The above commands all end with ` {cmd_sep} `
-        try cmd.appendSlice("echo ok");
-
+        var env = std.ArrayList([]const u8).init(self.arena.allocator());
+        defer env.deinit();
         if (run_setup_tests) {
             try env.appendSlice(&[_][]const u8{ "TEST", "true" });
         }
-
         try run_shell_with_env(
             self.arena,
             cmd.items,
             env.items,
         );
+
+        try prepare_directory_and_integrate(self.arena, self.language, tmp_dir.path);
     }
 
     fn print(self: Generator, msg: []const u8) void {

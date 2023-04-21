@@ -1,4 +1,63 @@
+const std = @import("std");
+
 const Docs = @import("../docs_types.zig").Docs;
+const run = @import("../shutil.zig").run;
+
+// Caller is responsible for resetting to a good cwd after this completes.
+fn find_node_client_tar(arena: *std.heap.ArenaAllocator, root: []const u8) ![]const u8 {
+    var tries: usize = 2;
+    while (tries > 0) {
+        try std.os.chdir(root);
+
+        const node_dir = try std.fs.cwd().realpathAlloc(arena.allocator(), "src/clients/node");
+
+        var dir = try std.fs.cwd().openDir(node_dir, .{ .iterate = true });
+        defer dir.close();
+
+        var walker = try dir.walk(arena.allocator());
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.path, "tigerbeetle-node-") and std.mem.endsWith(u8, entry.path, ".tgz")) {
+                return std.fmt.allocPrint(
+                    arena.allocator(),
+                    "{s}/{s}",
+                    .{ node_dir, entry.path },
+                );
+            }
+        }
+
+        try std.os.chdir(node_dir);
+        try run(arena, &[_][]const u8{ "npm", "install" });
+        try run(arena, &[_][]const u8{ "npm", "pack" });
+        tries -= 1;
+    }
+
+    std.debug.print("Could not find src/clients/node/tigerbeetle-node-*.tgz, run npm install && npm pack in src/clients/node\n", .{});
+    return error.PackageNotFound;
+}
+
+fn node_current_commit_post_install_hook(
+    arena: *std.heap.ArenaAllocator,
+    sample_dir: []const u8,
+    root: []const u8,
+) !void {
+    const package = try find_node_client_tar(arena, root);
+
+    try std.os.chdir(sample_dir);
+
+    // Swap out the normal tigerbeetle-node with our local version.
+    try run(arena, &[_][]const u8{
+        "npm",
+        "uninstall",
+        "tigerbeetle-node",
+    });
+    try run(arena, &[_][]const u8{
+        "npm",
+        "install",
+        package,
+    });
+}
 
 pub const NodeDocs = Docs{
     .directory = "node",
@@ -37,11 +96,12 @@ pub const NodeDocs = Docs{
     .build_commands = "npm install typescript @types/node && npx tsc --allowJs --noEmit main.js",
     .run_commands = "node main.js",
 
-    .current_commit_pre_install_commands = "",
-    .current_commit_post_install_commands = 
-    \\npm remove tigerbeetle-node
-    \\npm install $TB_ROOT/src/clients/node/tigerbeetle-node-*.tgz
-    ,
+    .current_commit_install_commands_hook = null,
+    .current_commit_build_commands_hook = null,
+    .current_commit_run_commands_hook = null,
+
+    .current_commit_pre_install_hook = null,
+    .current_commit_post_install_hook = node_current_commit_post_install_hook,
 
     .install_documentation = 
     \\If you run into issues, check out the distribution-specific install

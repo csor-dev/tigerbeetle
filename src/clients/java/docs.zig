@@ -1,4 +1,110 @@
+const std = @import("std");
+
 const Docs = @import("../docs_types.zig").Docs;
+const run = @import("../shutil.zig").run;
+const script_filename = @import("../shutil.zig").script_filename;
+
+// Caller is responsible for resetting to a good cwd after this completes.
+fn find_tigerbeetle_client_jar(arena: *std.heap.ArenaAllocator, root: []const u8) ![]const u8 {
+    try std.os.chdir(root);
+
+    var tries: usize = 2;
+    var java_target_path: []const u8 = "";
+    while (tries > 0) {
+        if (std.fs.cwd().realpathAlloc(arena.allocator(), "src/clients/java/target")) |path| {
+            java_target_path = path;
+            break;
+        } else |err| switch (err) {
+            else => {
+                // target directory doesn't exist, let's try building the Java client.
+                try std.os.chdir("src/clients/java");
+                try run(arena, &[_][]const u8{
+                    try script_filename(arena, &[_][]const u8{ "scripts", "install" }),
+                });
+
+                // Retry opening the directory now that we've run the install script.
+                try std.os.chdir(root);
+                tries -= 1;
+            },
+        }
+    }
+
+    var dir = try std.fs.cwd().openDir(java_target_path, .{ .iterate = true });
+    defer dir.close();
+
+    var walker = try dir.walk(arena.allocator());
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (std.mem.endsWith(u8, entry.path, "-SNAPSHOT.jar")) {
+            return std.fmt.allocPrint(
+                arena.allocator(),
+                "{s}/{s}",
+                .{ java_target_path, entry.path },
+            );
+        }
+    }
+
+    std.debug.print("Could not find src/clients/java/target/**/*-SNAPSHOT.jar, run: cd src/clients/java && ./scripts/install.sh)\n", .{});
+    return error.JarFileNotfound;
+}
+
+fn java_current_commit_pre_install_hook(
+    arena: *std.heap.ArenaAllocator,
+    sample_root: []const u8,
+    root: []const u8,
+) !void {
+    const jar_file = try find_tigerbeetle_client_jar(arena, root);
+    // Generate a local maven package from a JAR.
+    try run(arena, &[_][]const u8{
+        "mvn",
+        "deploy:deploy-file",
+        try std.fmt.allocPrint(arena.allocator(), "-Durl=file://{s}", .{sample_root}),
+        try std.fmt.allocPrint(arena.allocator(), "-Dfile=file://{s}", .{jar_file}),
+        "-DgroupId=com.tigerbeetle",
+        "-DartifactId=tigerbeetle-java",
+        "-Dpackaging=jar",
+        "-Dversion=0.0.1-3431",
+    });
+
+    // Write out the local-settings.xml that points maven out our local package.
+    const local_settings_xml_path = try std.fmt.allocPrint(
+        arena.allocator(),
+        "{s}/local-settings.xml",
+        .{sample_root},
+    );
+    var local_settings_xml = try std.fs.cwd().createFile(
+        local_settings_xml_path,
+        .{ .truncate = true },
+    );
+    defer local_settings_xml.close();
+    _ = try local_settings_xml.write(
+        try std.fmt.allocPrint(
+            arena.allocator(),
+            \\<settings
+            \\  xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+            \\  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            \\  xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd"
+            \\>
+            \\  <localRepository>
+            \\    {s}
+            \\  </localRepository>
+            \\</settings>
+        ,
+            .{sample_root},
+        ),
+    );
+}
+
+fn local_command_hook(arena: *std.heap.ArenaAllocator, cmd: []const u8) ![]const u8 {
+    return try std.mem.replaceOwned(
+        u8,
+        arena.allocator(),
+        cmd,
+        "mvn",
+        "mvn -s local-settings.xml",
+    );
+}
 
 pub const JavaDocs = Docs{
     .directory = "java",
@@ -91,17 +197,16 @@ pub const JavaDocs = Docs{
 
     .install_prereqs = "apk add -U maven openjdk11",
 
-    .current_commit_pre_install_commands = 
-    \\mvn deploy:deploy-file -Durl=file://$SAMPLE_ROOT -Dfile=$(find . -name '*-SNAPSHOT.jar') -DgroupId=com.tigerbeetle -DartifactId=tigerbeetle-java -Dpackaging=jar -Dversion=0.0.1-3431
-    \\mkdir -p $HOME/.m2/
-    \\echo '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd"><localRepository>'$SAMPLE_ROOT'</localRepository></settings>' > $HOME/.m2/settings.xml
-    ,
-
-    .current_commit_post_install_commands = "",
+    .current_commit_pre_install_hook = java_current_commit_pre_install_hook,
+    .current_commit_post_install_hook = null,
 
     .install_commands = "mvn install",
     .build_commands = "mvn compile",
     .run_commands = "mvn exec:java",
+
+    .current_commit_install_commands_hook = local_command_hook,
+    .current_commit_build_commands_hook = local_command_hook,
+    .current_commit_run_commands_hook = local_command_hook,
 
     .install_documentation = "",
 
