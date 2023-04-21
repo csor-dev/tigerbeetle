@@ -369,8 +369,8 @@ const Generator = struct {
                 \\$PSDefaultParameterValues['*:ErrorAction']='Stop'
                 \\$LASTEXITCODE = 0
                 \\
-                ++
-                self.language.developer_setup_pwsh_commands
+                    ++
+                    self.language.developer_setup_pwsh_commands
             else
                 self.language.developer_setup_sh_commands,
         );
