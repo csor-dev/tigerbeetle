@@ -15,6 +15,9 @@ const java_docs = @import("./java/docs.zig").JavaDocs;
 const go_docs = @import("./go/docs.zig").GoDocs;
 const node_docs = @import("./node/docs.zig").NodeDocs;
 const Docs = @import("./docs_types.zig").Docs;
+const TmpDir = @import("./shutil.zig").TmpDir;
+const git_root = @import("./shutil.zig").git_root;
+const run_shell = @import("./shutil.zig").run_shell;
 const prepare_directory_and_integrate = @import("./docs_generate.zig").prepare_directory_and_integrate;
 
 fn copy_into_tmp_dir(
@@ -100,18 +103,18 @@ fn error_main() !void {
         "{s}/src/clients/{s}/samples/{s}",
         .{
             root,
-            language.directory,
+            language.?.directory,
             sample,
         },
     );
-    var tmp_copy = try copy_into_tmp_dir(arena, sample_dir);
+    var tmp_copy = try copy_into_tmp_dir(&arena, sample_dir);
     defer {
         if (!keep_tmp) {
             tmp_copy.deinit();
         }
     }
 
-    try prepare_directory_and_integrate(&arena, language, root, sample);
+    try prepare_directory_and_integrate(&arena, language.?, sample_dir);
 }
 
 // Returning errors in main produces useless traces, at least for some
