@@ -1825,6 +1825,7 @@ pub fn ReplicaType(
             assert(message.header.command == .request_start_view);
             assert(message.header.epoch == self.epoch);
             if (self.ignore_repair_message(message)) return;
+            if (self.epoch != self.epoch_durable()) return;
 
             assert(self.status == .normal);
             assert(self.view == self.log_view);
@@ -1928,11 +1929,11 @@ pub fn ReplicaType(
 
         fn on_request_headers(self: *Self, message: *const Message) void {
             assert(message.header.command == .request_headers);
-            assert(message.header.epoch == self.epoch);
+            assert(message.header.epoch == self.epoch or
+                (self.epoch_old != null and message.header.epoch == self.epoch_old.?.epoch));
             if (self.ignore_repair_message(message)) return;
 
             maybe(self.status == .recovering_head);
-            assert(message.header.epoch == self.epoch);
             maybe(message.header.view == self.view);
             assert(message.header.replica != self.replica);
 
@@ -1944,9 +1945,9 @@ pub fn ReplicaType(
                 // We echo the context back to the replica so that they can match up our response:
                 .context = message.header.context,
                 .cluster = self.cluster,
-                .replica = self.replica,
-                .view = self.view,
-                .epoch = self.epoch,
+                .replica = self.replica_epoch(message.header.epoch),
+                .view = self.view, // FIXME
+                .epoch = message.header.epoch,
             };
 
             const op_min = message.header.commit;
@@ -3253,7 +3254,6 @@ pub fn ReplicaType(
                 assert((self.log_view == self.view) == (command == .start_view));
                 assert(self.log_view < self.view or self.replica == self.primary_index(self.view));
             } else {
-                // FIXME: Correct?
                 assert(command == .do_view_change);
                 assert(self.log_view == 0);
             }
@@ -5702,9 +5702,10 @@ pub fn ReplicaType(
                     // FIXME
                 },
                 .headers => {
-                    assert(!self.standby());
-                    assert(message.header.view == self.view);
-                    assert(message.header.replica == self.replica);
+                    assert(!self.standby_epoch(message.header.epoch));
+                    assert(message.header.epoch == epoch);
+                    assert(message.header.view == self.view); // FIXME
+                    assert(message.header.replica == self.replica_epoch(message.header.epoch));
                     assert(message.header.replica != replica);
                 },
                 .ping => {
@@ -6344,7 +6345,7 @@ pub fn ReplicaType(
             assert(self.epoch_old != null);
             assert(self.end_epoch_message_timeout.ticking);
 
-            std.debug.print("{}: epoch_retire_old op={} final_prepare.op={}\n", .{
+            log.err("{}: epoch_retire_old op={} final_prepare.op={}\n", .{
                 self.replica,
                 self.op,
                 self.epoch_old.?.final_prepare.op,
