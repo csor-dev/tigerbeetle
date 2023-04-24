@@ -92,12 +92,16 @@ multiple concurrent tasks.
 Multiple clients are useful when connecting to more than
 one TigerBeetle cluster.
 
-In this example the cluster ID is `0` and there are
-three replicas running on ports `3001`, `3002`, and
-`3003`.
+In this example the cluster ID is `0` and there is one
+replica. The address is read from the `TB_ADDRESS`
+environment variable and defaults to port `3000`.
 
 ```go
-client, err := tb.NewClient(0, []string{"3001", "3002", "3003"}, 1)
+tbAddress := os.Getenv("TB_ADDRESS")
+if len(tbAddress) == 0 {
+  tbAddress = "3000"
+} 
+client, err := tb.NewClient(0, []string{tbAddress}, 1)
 if err != nil {
 	log.Printf("Error creating client: %s", err)
 	return

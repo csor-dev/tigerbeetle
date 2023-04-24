@@ -213,9 +213,10 @@ pub const JavaDocs = Docs{
     .examples = "",
 
     .client_object_example = 
+    \\var tbAddress = System.getenv("TB_ADDRESS");
     \\Client client = new Client(
     \\  0,
-    \\  new String[] {"3001", "3002", "3003"}
+    \\  new String[] {tbAddress.length() > 0 ? tbAddress : "3000"}
     \\);
     ,
 

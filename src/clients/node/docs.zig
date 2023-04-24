@@ -127,7 +127,7 @@ pub const NodeDocs = Docs{
     .client_object_example = 
     \\const client = createClient({
     \\  cluster_id: 0,
-    \\  replica_addresses: ['3001', '3002', '3003']
+    \\  replica_addresses: [process.env.TB_ADDRESS || '3000']
     \\});
     ,
     .client_object_documentation = "",

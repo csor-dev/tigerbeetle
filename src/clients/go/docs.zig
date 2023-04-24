@@ -130,7 +130,11 @@ pub const GoDocs = Docs{
     ,
 
     .client_object_example = 
-    \\client, err := tb.NewClient(0, []string{"3001", "3002", "3003"}, 1)
+    \\tbAddress := os.Getenv("TB_ADDRESS")
+    \\if len(tbAddress) == 0 {
+    \\  tbAddress = "3000"
+    \\} 
+    \\client, err := tb.NewClient(0, []string{tbAddress}, 1)
     \\if err != nil {
     \\	log.Printf("Error creating client: %s", err)
     \\	return
@@ -374,6 +378,7 @@ pub const GoDocs = Docs{
     \\package main
     \\
     \\import "log"
+    \\import "os"
     \\
     \\import tb "github.com/tigerbeetledb/tigerbeetle-go"
     \\import tb_types "github.com/tigerbeetledb/tigerbeetle-go/pkg/types"

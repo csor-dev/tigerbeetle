@@ -465,9 +465,9 @@ const Generator = struct {
             \\Multiple clients are useful when connecting to more than
             \\one TigerBeetle cluster.
             \\
-            \\In this example the cluster ID is `0` and there are
-            \\three replicas running on ports `3001`, `3002`, and
-            \\`3003`.
+            \\In this example the cluster ID is `0` and there is one
+            \\replica. The address is read from the `TB_ADDRESS`
+            \\environment variable and defaults to port `3000`.
         );
         mw.code(language.markdown_name, language.client_object_example);
         mw.paragraph(language.client_object_documentation);

@@ -126,14 +126,15 @@ multiple concurrent tasks.
 Multiple clients are useful when connecting to more than
 one TigerBeetle cluster.
 
-In this example the cluster ID is `0` and there are
-three replicas running on ports `3001`, `3002`, and
-`3003`.
+In this example the cluster ID is `0` and there is one
+replica. The address is read from the `TB_ADDRESS`
+environment variable and defaults to port `3000`.
 
 ```java
+var tbAddress = System.getenv("TB_ADDRESS");
 Client client = new Client(
   0,
-  new String[] {"3001", "3002", "3003"}
+  new String[] {tbAddress.length() > 0 ? tbAddress : "3000"}
 );
 ```
 
