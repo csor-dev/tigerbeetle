@@ -317,6 +317,8 @@ pub const SuperBlockHeader = extern struct {
         return vsr.Headers.ViewChangeSlice.init(
             if (superblock.vsr_state.log_view < superblock.vsr_state.view)
                 .do_view_change
+            else if (superblock.vsr_headers_count == 1)
+                vsr.ViewChangeCommand.end_epoch
             else
                 .start_view,
             superblock.vsr_headers_all[0..superblock.vsr_headers_count],

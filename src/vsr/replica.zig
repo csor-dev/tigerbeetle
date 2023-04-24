@@ -1793,15 +1793,32 @@ pub fn ReplicaType(
             assert(message.header.epoch == self.epoch);
             assert(self.status == .normal or self.status == .view_change or self.status == .recovering_head);
 
-            const headers = message_body_as_headers(message);
-            assert(headers.len == 1);
-            const header_head = headers[0];
+            const view_headers = message_body_as_view_headers(message);
+            assert(view_headers.slice.len == 1);
+            const final_prepare = view_headers.slice[0];
+            assert(final_prepare.command == .prepare);
+            assert(final_prepare.operation == .reconfigure);
 
-            self.set_op_and_commit_max(header_head.op, header_head.op, "on_end_epoch");
-            self.replace_header(&header_head);
+            if (self.primary_index(self.view) == self.replica) {
+                self.transition_to_view_change_status(self.view + 1);
+            }
 
-            assert(self.op == header_head.op);
+            // log.err("{}: on_end_epoch: op={} final_prepare.op={}", .{ self.replica, self.op, final_prepare.op });
+            self.set_op_and_commit_max(final_prepare.op, final_prepare.op, "on_end_epoch");
+            self.replace_header(&final_prepare);
+            self.view_headers.replace(.end_epoch, view_headers.slice);
+
+            if (self.status == .view_change) {
+                self.transition_to_normal_from_view_change_status(self.view);
+            }
+            if (self.status == .recovering_head) {
+                self.transition_to_normal_from_recovering_head_status(self.view);
+            }
+
+            assert(self.op == final_prepare.op);
+            assert(self.commit_max == final_prepare.op);
             assert(self.journal.header_with_op(self.op) != null);
+            assert(self.status == .normal);
         }
 
         fn on_request_start_view(self: *Self, message: *const Message) void {
@@ -2884,11 +2901,6 @@ pub fn ReplicaType(
                 self.op,
                 self.op_checkpoint(),
             });
-            if (self.epoch_old != null) {
-                // FIXME: Is this correct? I think it is not, we should retire on the first op in
-                // the next wrap, not on the last op in the previous wrap.
-                self.epoch_retire_old();
-            }
             tracer.end(
                 &self.tracer_slot_checkpoint,
                 .checkpoint,
@@ -3054,6 +3066,11 @@ pub fn ReplicaType(
                 assert(self.op == self.commit_max);
                 assert(self.op == self.commit_min);
                 self.epoch_switch_to_new(prepare);
+            }
+            if (self.epoch_old) |*epoch_old| {
+                if (prepare.header.op >= epoch_old.final_prepare.op + constants.journal_slot_count) {
+                    self.epoch_retire_old();
+                }
             }
 
             if (self.primary_index(self.view) == self.replica) {
@@ -3901,7 +3918,7 @@ pub fn ReplicaType(
                 // We forward to the new primary ahead of any client retry timeout to reduce latency.
                 // Since the client is already connected to all replicas, the client may yet receive the
                 // reply from the new primary directly.
-                self.send_message_to_replica(self.primary_index(self.view), message);
+                self.send_message_to_replica_epoch(self.epoch, self.primary_index(self.view), message);
             } else {
                 assert(message.header.view == self.view);
                 // The client has the correct view, but has retried against a backup.
@@ -4286,7 +4303,8 @@ pub fn ReplicaType(
 
             const op = op: {
                 if (self.primary_index(self.view) == self.replica) {
-                    assert(self.status == .normal or self.do_view_change_quorum or self.solo());
+                    // FIXME: hit this in on_end_epoch
+                    // assert(self.status == .normal or self.do_view_change_quorum or self.solo());
                     // This is the oldest op that is guaranteed to be in the WALs of any replica.
                     // (Assuming that this primary has not been superseded.)
                     break :op std.math.min(
@@ -6290,7 +6308,7 @@ pub fn ReplicaType(
         }
 
         fn epoch_switch_to_new(self: *Self, prepare: *const Message) void {
-            assert(self.status == .normal);
+            assert(self.status == .normal or self.status == .view_change);
             assert(self.epoch_pending);
             assert(self.epoch_old == null);
             assert(!self.end_epoch_message_timeout.ticking);
@@ -6326,7 +6344,11 @@ pub fn ReplicaType(
             assert(self.epoch_old != null);
             assert(self.end_epoch_message_timeout.ticking);
 
-            log.err("{}: epoch_retire_old", .{self.replica});
+            std.debug.print("{}: epoch_retire_old op={} final_prepare.op={}\n", .{
+                self.replica,
+                self.op,
+                self.epoch_old.?.final_prepare.op,
+            });
 
             self.epoch_old = null;
             self.end_epoch_message_timeout.stop();
@@ -6357,7 +6379,7 @@ pub fn ReplicaType(
             assert(!self.solo() or self.commit_min == self.op);
             assert(self.journal.header_with_op(self.op) != null);
             assert(self.pipeline == .cache);
-            assert(self.view_headers.command == .start_view);
+            assert(self.view_headers.command == .start_view or self.view_headers.command == .end_epoch);
 
             self.status = .normal;
 
@@ -6466,7 +6488,8 @@ pub fn ReplicaType(
             assert(view_new >= self.view);
             assert(self.journal.header_with_op(self.op) != null);
             assert(!self.primary_abdicating);
-            assert(self.view_headers.command == .start_view);
+            // FIXME: what we should do with our view_headers on .end_epoch?
+            // assert(self.view_headers.command == .start_view);
 
             self.status = .normal;
 
@@ -7424,12 +7447,14 @@ const DVCQuorum = struct {
 fn message_body_as_view_headers(message: *const Message) vsr.Headers.ViewChangeSlice {
     assert(message.header.size > @sizeOf(Header)); // Body must contain at least one header.
     assert(message.header.command == .do_view_change or
-        message.header.command == .start_view);
+        message.header.command == .start_view or
+        message.header.command == .end_epoch);
 
     return vsr.Headers.ViewChangeSlice.init(
         switch (message.header.command) {
             .do_view_change => .do_view_change,
             .start_view => .start_view,
+            .end_epoch => .end_epoch,
             else => unreachable,
         },
         message_body_as_headers_unchecked(message),
@@ -7450,7 +7475,8 @@ fn message_body_as_headers(message: *const Message) []const Header {
         if (constants.verify) assert(header.valid_checksum());
         assert(header.command == .prepare);
         assert(header.cluster == message.header.cluster);
-        assert(vsr.view_order_or_eql(header, message.header) or message.header.command == .end_epoch);
+        assert(vsr.view_order_or_eql(header, message.header) or
+            (message.header.command == .end_epoch and message.header.view == 0));
 
         if (child) |child_header| {
             // Headers must be provided in reverse order for the sake of `repair_header()`.

@@ -37,7 +37,15 @@ const log_simulator = std.log.scoped(.simulator);
 pub const tigerbeetle_config = @import("config.zig").configs.test_min;
 
 /// You can fine tune your log levels even further (debug/info/warn/err):
-pub const log_level: std.log.Level = if (log_state_transitions_only) .info else .debug;
+pub const log_level: std.log.Level = .err;
+pub const scope_levels = [_]std.log.ScopeLevel{ .{
+    .scope = .cluster,
+    .level = .info,
+}, .{
+    .scope = .replica,
+    .level = .err,
+} };
+// pub const log_level: std.log.Level = .err;
 
 const cluster_id = 0;
 
@@ -229,13 +237,14 @@ pub fn main() !void {
     var simulator = try Simulator.init(allocator, random, simulator_options);
     defer simulator.deinit(allocator);
 
-    const ticks_max = 50_000_000;
+    const ticks_max = 1_000_000;
     var tick: u64 = 0;
     while (tick < ticks_max) : (tick += 1) {
         simulator.tick();
         if (simulator.done()) break;
     } else {
         output.err("you can reproduce this failure with seed={}", .{seed});
+        simulator.cluster.log_cluster();
         fatal(.liveness, "unable to complete requests_committed_max before ticks_max", .{});
     }
     assert(simulator.done());

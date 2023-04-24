@@ -343,7 +343,7 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
             try cluster.open_replica(replica_index, time);
             cluster.network.process_enable(.{ .replica = replica_index });
             cluster.replica_health[replica_index] = .up;
-            cluster.log_replica(.recover, replica_index);
+            // cluster.log_replica(.recover, replica_index);
         }
 
         /// Reset a replica to its initial state, simulating a random crash/panic.
@@ -358,7 +358,7 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
             cluster.replicas[replica_index].deinit(cluster.allocator);
             cluster.network.process_disable(.{ .replica = replica_index });
             cluster.replica_health[replica_index] = .down;
-            cluster.log_replica(.crash, replica_index);
+            // cluster.log_replica(.crash, replica_index);
 
             // Ensure that none of the replica's messages leaked when it was deinitialized.
             var messages_in_pool: usize = 0;
@@ -461,7 +461,7 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
             const stable_index = cluster.get_stable_index(replica);
             assert(cluster.replica_health[stable_index] == .up);
 
-            cluster.log_replica(.commit, stable_index);
+            // cluster.log_replica(.commit, stable_index);
             cluster.state_checker.check_state(stable_index) catch |err| {
                 fatal(.correctness, "state checker error: {}", .{err});
             };
@@ -481,7 +481,7 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
             const stable_index = cluster.get_stable_index(replica);
             assert(cluster.replica_health[stable_index] == .up);
 
-            cluster.log_replica(.checkpoint_start, stable_index);
+            // cluster.log_replica(.checkpoint_start, stable_index);
         }
 
         fn on_replica_checkpoint_done(replica: *const Replica) void {
@@ -489,7 +489,7 @@ pub fn ClusterType(comptime StateMachineType: fn (comptime Storage: type, compti
             const stable_index = cluster.get_stable_index(replica);
             assert(cluster.replica_health[stable_index] == .up);
 
-            cluster.log_replica(.checkpoint_done, stable_index);
+            // cluster.log_replica(.checkpoint_done, stable_index);
             cluster.storage_checker.replica_checkpoint(replica) catch |err| {
                 fatal(.correctness, "storage checker error: {}", .{err});
             };

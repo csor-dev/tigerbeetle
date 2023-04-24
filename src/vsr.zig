@@ -1231,7 +1231,7 @@ pub const Headers = struct {
     }
 };
 
-pub const ViewChangeCommand = enum { do_view_change, start_view };
+pub const ViewChangeCommand = enum { do_view_change, start_view, end_epoch };
 
 const ViewChangeHeadersSlice = struct {
     command: ViewChangeCommand,
@@ -1250,6 +1250,7 @@ const ViewChangeHeadersSlice = struct {
     pub fn verify(headers: ViewChangeHeadersSlice) void {
         assert(headers.slice.len > 0);
         assert(headers.slice.len <= constants.view_change_headers_max);
+        assert(headers.command == .start_view or headers.command == .do_view_change or headers.command == .end_epoch);
 
         const head = &headers.slice[0];
         // A DVC's head op is never a gap or faulty.
@@ -1280,7 +1281,7 @@ const ViewChangeHeadersSlice = struct {
 
             switch (Headers.dvc_header_type(header)) {
                 .blank => {
-                    assert(headers.command == .do_view_change);
+                    assert(headers.command == .do_view_change or headers.command == .end_epoch);
                     continue; // Don't update "child".
                 },
                 .valid => {
