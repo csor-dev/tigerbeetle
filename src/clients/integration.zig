@@ -114,7 +114,7 @@ fn error_main() !void {
         }
     }
 
-    try prepare_directory_and_integrate(&arena, language.?, tmp_copy.path);
+    try prepare_directory_and_integrate(&arena, language.?, tmp_copy.path, true);
 }
 
 // Returning errors in main produces useless traces, at least for some

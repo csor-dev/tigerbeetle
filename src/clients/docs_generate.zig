@@ -133,7 +133,10 @@ const MarkdownWriter = struct {
     }
 };
 
-fn write_shell_newlines_into_single_line(into: *std.ArrayList(u8), from: []const u8) !void {
+fn write_shell_newlines_into_single_line(
+    into: *std.ArrayList(u8),
+    from: []const u8,
+) !void {
     if (from.len == 0) {
         return;
     }
@@ -142,12 +145,16 @@ fn write_shell_newlines_into_single_line(into: *std.ArrayList(u8), from: []const
     while (lines.next()) |line| {
         try into.writer().print("{s} {s} ", .{ line, cmd_sep });
     }
+
+    // The above commands all end with ` {cmd_sep} `
+    try into.appendSlice("echo ok");
 }
 
 pub fn prepare_directory_and_integrate(
     arena: *std.heap.ArenaAllocator,
     language: Docs,
     dir: []const u8,
+    integrate: bool,
 ) !void {
     var cmd = std.ArrayList(u8).init(arena.allocator());
     defer cmd.deinit();
@@ -166,8 +173,6 @@ pub fn prepare_directory_and_integrate(
         &cmd,
         language.install_commands,
     );
-    // The above commands all end with ` {cmd_sep} `
-    try cmd.appendSlice("echo ok");
     try run_shell(arena, cmd.items);
 
     if (language.current_commit_post_install_hook) |hook| {
@@ -180,13 +185,19 @@ pub fn prepare_directory_and_integrate(
     cmd.clearRetainingCapacity();
     try write_shell_newlines_into_single_line(
         &cmd,
-        language.run_commands,
+        language.build_commands,
     );
+    try run_shell(arena, cmd.items);
 
-    // The above commands all end with ` {cmd_sep} `
-    try cmd.appendSlice("echo ok");
+    if (integrate) {
+        cmd.clearRetainingCapacity();
+        try write_shell_newlines_into_single_line(
+            &cmd,
+            language.run_commands,
+        );
 
-    try run_with_tb(arena, try shell_wrap(arena, cmd.items), dir);
+        try run_with_tb(arena, try shell_wrap(arena, cmd.items), dir);
+    }
 }
 
 const Generator = struct {
@@ -252,21 +263,16 @@ const Generator = struct {
 
         var cmd = std.ArrayList(u8).init(self.arena.allocator());
         // First run general setup within already cloned repo
-        try write_shell_newlines_into_single_line(
-            &cmd,
-            if (builtin.os.tag == .windows)
-                \\Set-StrictMode -Version 3
-                \\$ErrorActionPreference = "Stop"
-                \\$PSDefaultParameterValues['*:ErrorAction']='Stop'
-                \\$LASTEXITCODE = 0
-                \\
-                    ++
-                    self.language.developer_setup_pwsh_commands
-            else
-                self.language.developer_setup_sh_commands,
-        );
-
-        try cmd.appendSlice("echo ok");
+        try write_shell_newlines_into_single_line(&cmd, if (builtin.os.tag == .windows)
+            \\Set-StrictMode -Version 3
+            \\$ErrorActionPreference = "Stop"
+            \\$PSDefaultParameterValues['*:ErrorAction']='Stop'
+            \\$LASTEXITCODE = 0
+            \\
+                ++
+                self.language.developer_setup_pwsh_commands
+        else
+            self.language.developer_setup_sh_commands);
 
         var env = std.ArrayList([]const u8).init(self.arena.allocator());
         defer env.deinit();
@@ -279,7 +285,9 @@ const Generator = struct {
             env.items,
         );
 
-        try prepare_directory_and_integrate(self.arena, self.language, tmp_dir.path);
+        // TODO: JavaScript integration is not yet working.
+        const integrate = !std.mem.eql(u8, self.language.markdown_name, "javascript");
+        try prepare_directory_and_integrate(self.arena, self.language, tmp_dir.path, integrate);
     }
 
     fn print(self: Generator, msg: []const u8) void {
