@@ -301,26 +301,26 @@ const Generator = struct {
         ) catch unreachable;
     }
 
-    fn validate_minimal(self: Generator) !void {
+    fn validate_minimal(self: Generator, keepTmp: bool) !void {
         // Test the sample file
         self.print("Building minimal sample file");
         var tmp_dir = try TmpDir.init(self.arena);
-        defer tmp_dir.deinit();
+        defer if (!keepTmp) tmp_dir.deinit();
         try self.build_file_within_project(tmp_dir, self.language.install_sample_file, true);
     }
 
-    fn validate_aggregate(self: Generator) !void {
+    fn validate_aggregate(self: Generator, keepTmp: bool) !void {
         // Test major parts of sample code
         var sample = try self.make_aggregate_sample();
         self.print("Building aggregate sample file");
         var tmp_dir = try TmpDir.init(self.arena);
-        defer tmp_dir.deinit();
+        defer if (!keepTmp) tmp_dir.deinit();
         try self.build_file_within_project(tmp_dir, sample, false);
     }
 
     const tests = [_]struct {
         name: []const u8,
-        validate: fn (Generator) anyerror!void,
+        validate: fn (Generator, bool) anyerror!void,
     }{
         .{
             .name = "minimal",
@@ -781,6 +781,8 @@ pub fn main() !void {
     var global_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer global_arena.deinit();
 
+    var keepTmp = false;
+
     var args = std.process.args();
     _ = args.next(global_arena.allocator());
     while (args.next(global_arena.allocator())) |arg_or_err| {
@@ -809,6 +811,10 @@ pub fn main() !void {
 
         if (std.mem.eql(u8, arg, "--no-generate")) {
             generate = false;
+        }
+
+        if (std.mem.eql(u8, arg, "--keep-tmp")) {
+            keepTmp = true;
         }
     }
 
@@ -850,7 +856,7 @@ pub fn main() !void {
 
                 const root = try git_root(&arena);
                 try std.os.chdir(root);
-                try t.validate(generator);
+                try t.validate(generator, keepTmp);
             }
         }
 

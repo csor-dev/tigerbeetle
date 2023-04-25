@@ -161,15 +161,79 @@ pub const NodeDocs = Docs{
     ,
 
     .account_flags_example = 
-    \\let account0 = { /* ... account values ... */ };
-    \\let account1 = { /* ... account values ... */ };
+    \\let account0 = {
+    \\  id: 100n,
+    \\  reserved: Buffer.alloc(48, 0),
+    \\  user_data: 0n,
+    \\  ledger: 1,
+    \\  code: 1,
+    \\  debits_pending: 0n,
+    \\  debits_posted: 0n,
+    \\  credits_pending: 0n,
+    \\  credits_posted: 0n,
+    \\  timestamp: 0n,
+    \\  flags: 0,
+    \\  /* ... account values ... */
+    \\};
+    \\let account1 = {
+    \\  id: 101n,
+    \\  user_data: 0n,
+    \\  reserved: Buffer.alloc(48, 0),
+    \\  ledger: 1,
+    \\  code: 1,
+    \\  debits_pending: 0n,
+    \\  debits_posted: 0n,
+    \\  credits_pending: 0n,
+    \\  credits_posted: 0n,
+    \\  timestamp: 0n,
+    \\  flags: 0,
+    \\  /* ... account values ... */
+    \\};
     \\account0.flags = AccountFlags.linked | AccountFlags.debits_must_not_exceed_credits;
     \\accountErrors = await client.createAccounts([account0, account1]);
     ,
     .create_accounts_errors_example = 
-    \\let account2 = { /* ... account values ... */ };
-    \\let account3 = { /* ... account values ... */ };
-    \\let account4 = { /* ... account values ... */ };
+    \\let account2 = {
+    \\  id: 102n,
+    \\  reserved: Buffer.alloc(48, 0),
+    \\  user_data: 0n,
+    \\  ledger: 1,
+    \\  code: 1,
+    \\  debits_pending: 0n,
+    \\  debits_posted: 0n,
+    \\  credits_pending: 0n,
+    \\  credits_posted: 0n,
+    \\  timestamp: 0n,
+    \\  flags: 0,
+    \\  /* ... account values ... */
+    \\};
+    \\let account3 = {
+    \\  id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: Buffer.alloc(48, 0),
+    \\  ledger: 1,
+    \\  code: 1,
+    \\  debits_pending: 0n,
+    \\  debits_posted: 0n,
+    \\  credits_pending: 0n,
+    \\  credits_posted: 0n,
+    \\  timestamp: 0n,
+    \\  flags: 0,
+    \\  /* ... account values ... */
+    \\};
+    \\let account4 = {
+    \\  id: 104n,
+    \\  user_data: 0n,
+    \\  reserved: Buffer.alloc(48, 0),
+    \\  ledger: 1,
+    \\  code: 1,
+    \\  debits_pending: 0n,
+    \\  debits_posted: 0n,
+    \\  credits_pending: 0n,
+    \\  credits_posted: 0n,
+    \\  timestamp: 0n,
+    \\  flags: 0,
+    \\};
     \\accountErrors = await client.createAccounts([account2, account3, account4]);
     \\for (const error of accountErrors) {
     \\  switch (error.result) {
@@ -211,8 +275,8 @@ pub const NodeDocs = Docs{
     \\let transfer = {
     \\  id: 1n,
     \\  pending_id: 0n,
-    \\  debit_account_id: 1n,
-    \\  credit_account_id: 2n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
     \\  user_data: 0n,
     \\  reserved: 0n,
     \\  timeout: 0n,
@@ -269,29 +333,103 @@ pub const NodeDocs = Docs{
     \\* `TransferFlags.void_pending_transfer`
     ,
     .transfer_flags_link_example = 
-    \\transfer0 = { /* ... transfer values ... */ };
-    \\transfer1 = { /* ... transfer values ... */ };
+    \\let transfer0 = {
+    \\  id: 2n,
+    \\  pending_id: 0n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: 0n,
+    \\  timeout: 0n,
+    \\  ledger: 1,
+    \\  code: 720,
+    \\  flags: 0,
+    \\  amount: 10n,
+    \\  timestamp: 0n,
+    \\};
+    \\let transfer1 = {
+    \\  id: 3n,
+    \\  pending_id: 0n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: 0n,
+    \\  timeout: 0n,
+    \\  ledger: 1,
+    \\  code: 720,
+    \\  flags: 0,
+    \\  amount: 10n,
+    \\  timestamp: 0n,
+    \\};
     \\transfer0.flags = TransferFlags.linked;
     \\// Create the transfer
     \\transferErrors = await client.createTransfers([transfer0, transfer1]);
     ,
     .transfer_flags_post_example = 
-    \\transfer = {
-    \\  id: 2n,
-    \\  pending_id: 1n,
-    \\  flags: TransferFlags.post_pending_transfer,
+    \\let transfer2 = {
+    \\  id: 4n,
+    \\  pending_id: 0n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: 0n,
+    \\  timeout: 0n,
+    \\  ledger: 1,
+    \\  code: 720,
+    \\  flags: TransferFlags.pending,
+    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
-    \\transferErrors = await client.createTransfers([transfer]);
+    \\transferErrors = await client.createTransfers([transfer2]);
+    \\
+    \\let transfer3 = {
+    \\  id: 5n,
+    \\  pending_id: 4n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: 0n,
+    \\  timeout: 0n,
+    \\  ledger: 1,
+    \\  code: 720,
+    \\  flags: TransferFlags.post_pending_transfer,
+    \\  amount: 10n,
+    \\  timestamp: 0n,
+    \\};
+    \\transferErrors = await client.createTransfers([transfer3]);
     ,
     .transfer_flags_void_example = 
-    \\transfer = {
-    \\  id: 2n,
-    \\  pending_id: 1n,
-    \\  flags: TransferFlags.void_pending_transfer,
+    \\let transfer4 = {
+    \\  id: 4n,
+    \\  pending_id: 0n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: 0n,
+    \\  timeout: 0n,
+    \\  ledger: 1,
+    \\  code: 720,
+    \\  flags: TransferFlags.pending,
+    \\  amount: 10n,
     \\  timestamp: 0n,
     \\};
-    \\transferErrors = await client.createTransfers([transfer]);
+    \\transferErrors = await client.createTransfers([transfer4]);
+    \\
+    \\let transfer5 = {
+    \\  id: 7n,
+    \\  pending_id: 6n,
+    \\  debit_account_id: 102n,
+    \\  credit_account_id: 103n,
+    \\  user_data: 0n,
+    \\  reserved: 0n,
+    \\  timeout: 0n,
+    \\  ledger: 1,
+    \\  code: 720,
+    \\  flags: TransferFlags.void_pending_transfer,
+    \\  amount: 10n,
+    \\  timestamp: 0n,
+    \\};
+    \\transferErrors = await client.createTransfers([transfer5]);
     ,
 
     .lookup_transfers_example = 
@@ -301,8 +439,8 @@ pub const NodeDocs = Docs{
     \\ * [{
     \\ *   id: 1n,
     \\ *   pending_id: 0n,
-    \\ *   debit_account_id: 1n,
-    \\ *   credit_account_id: 2n,
+    \\ *   debit_account_id: 102n,
+    \\ *   credit_account_id: 103n,
     \\ *   user_data: 0n,
     \\ *   reserved: 0n,
     \\ *   timeout: 0n,
@@ -318,7 +456,7 @@ pub const NodeDocs = Docs{
     .linked_events_example = 
     \\const batch = [];
     \\let linkedFlag = 0;
-    \\linkedFlag |= CreateTransferFlags.linked;
+    \\linkedFlag |= TransferFlags.linked;
     \\
     \\// An individual transfer (successful):
     \\batch.push({ id: 1n /* , ... */ });
@@ -374,7 +512,13 @@ pub const NodeDocs = Docs{
     // CI against forks and pull requests.
     .developer_setup_pwsh_commands = "",
     .test_main_prefix = 
-    \\const { createClient } = require("tigerbeetle-node");
+    \\const {
+    \\  createClient,
+    \\  AccountFlags,
+    \\  TransferFlags,
+    \\  CreateTransferError,
+    \\  CreateAccountError,
+    \\} = require("tigerbeetle-node");
     \\
     \\async function main() {
     ,
