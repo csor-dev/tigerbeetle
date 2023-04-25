@@ -173,7 +173,6 @@ pub const NodeDocs = Docs{
     \\  credits_posted: 0n,
     \\  timestamp: 0n,
     \\  flags: 0,
-    \\  /* ... account values ... */
     \\};
     \\let account1 = {
     \\  id: 101n,
@@ -187,7 +186,6 @@ pub const NodeDocs = Docs{
     \\  credits_posted: 0n,
     \\  timestamp: 0n,
     \\  flags: 0,
-    \\  /* ... account values ... */
     \\};
     \\account0.flags = AccountFlags.linked | AccountFlags.debits_must_not_exceed_credits;
     \\accountErrors = await client.createAccounts([account0, account1]);
@@ -205,7 +203,6 @@ pub const NodeDocs = Docs{
     \\  credits_posted: 0n,
     \\  timestamp: 0n,
     \\  flags: 0,
-    \\  /* ... account values ... */
     \\};
     \\let account3 = {
     \\  id: 103n,
@@ -219,7 +216,6 @@ pub const NodeDocs = Docs{
     \\  credits_posted: 0n,
     \\  timestamp: 0n,
     \\  flags: 0,
-    \\  /* ... account values ... */
     \\};
     \\let account4 = {
     \\  id: 104n,
