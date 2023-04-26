@@ -108,6 +108,21 @@ fn error_main() !void {
         },
     );
     var tmp_copy = try copy_into_tmp_dir(&arena, sample_dir);
+
+    // Not a great hack. The integration code depends on being able to
+    // init go.mod. This is reasonable in most cases but breaks
+    // integration testing of the sample code which do already including
+    // go.mod.
+    if (std.mem.eql(u8, language.?.markdown_name, "go")) {
+        try std.os.unlink(
+            try std.fmt.allocPrint(
+                arena.allocator(),
+                "{s}/go.mod",
+                .{tmp_copy.path},
+            ),
+        );
+    }
+
     defer {
         if (!keep_tmp) {
             tmp_copy.deinit();
