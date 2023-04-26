@@ -264,13 +264,14 @@ const Generator = struct {
         var cmd = std.ArrayList(u8).init(self.arena.allocator());
         // First run general setup within already cloned repo
         try write_shell_newlines_into_single_line(&cmd, if (builtin.os.tag == .windows)
-            \\Set-StrictMode -Version 3
-            \\$ErrorActionPreference = "Stop"
-            \\$PSDefaultParameterValues['*:ErrorAction']='Stop'
-            \\$LASTEXITCODE = 0
-            \\
-                ++
-                self.language.developer_setup_pwsh_commands
+            self.sprintf(
+                \\Set-StrictMode -Version 3
+                \\$ErrorActionPreference = "Stop"
+                \\$PSDefaultParameterValues['*:ErrorAction']='Stop'
+                \\$LASTEXITCODE = 0
+                \\
+                \\{s}
+            , .{self.language.developer_setup_pwsh_commands})
         else
             self.language.developer_setup_sh_commands);
 
