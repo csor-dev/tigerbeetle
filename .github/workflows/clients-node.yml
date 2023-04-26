@@ -129,5 +129,5 @@ jobs:
       - run: ./scripts/install.${{ matrix.os == 'windows-latest' && 'bat' || 'sh' }}
 
       - run: ./scripts/build.${{ matrix.os == 'windows-latest' && 'bat' || 'sh' }} client_docs -- --language node
-      - if: matrix.os == "ubuntu-latest"
+      - if: matrix.os == 'ubuntu-latest'
         run: ./scripts/fail_on_diff.sh
