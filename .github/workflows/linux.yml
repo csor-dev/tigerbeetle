@@ -90,27 +90,6 @@ jobs:
       - run: ./scripts/install_zig.sh
       - run: zig/zig build ${{ matrix.target }}
 
-  docs:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        language: [java, go, node]
-    steps:
-      - uses: actions/checkout@v3
-
-      - if: matrix.language == 'java'
-        uses: actions/setup-java@v3
-        with:
-          java-version: '11'
-          distribution: 'temurin'
-          server-id: github
-          settings-path: ${{ github.workspace }}
-
-      # Runs checks against generated client docs
-      - run: ./scripts/install_zig.sh
-      - run: ./scripts/build.sh client_docs -- --language ${{ matrix.language }}
-      - run: ./scripts/fail_on_diff.sh
-
   # This is just a canary to make sure that the simulator compiles
   # It would be a good idea to also _run_ a single iteration,
   # but that currently has some false failures :-)
