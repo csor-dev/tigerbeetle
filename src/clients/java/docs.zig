@@ -12,10 +12,12 @@ fn find_tigerbeetle_client_jar(arena: *std.heap.ArenaAllocator, root: []const u8
     var java_target_path: []const u8 = "";
     while (tries > 0) {
         if (std.fs.cwd().realpathAlloc(arena.allocator(), "src/clients/java/target")) |path| {
+            std.debug.print("Found jar.\n", .{});
             java_target_path = path;
             break;
         } else |err| switch (err) {
             else => {
+                std.debug.print("Could not find jar, rebuilding\.n", .{});
                 // target directory doesn't exist, let's try building the Java client.
                 try std.os.chdir("src/clients/java");
                 try run(arena, &[_][]const u8{
@@ -60,7 +62,7 @@ fn java_current_commit_pre_install_hook(
         "mvn",
         "deploy:deploy-file",
         try std.fmt.allocPrint(arena.allocator(), "-Durl=file://{s}", .{sample_root}),
-        try std.fmt.allocPrint(arena.allocator(), "-Dfile=file://{s}", .{jar_file}),
+        try std.fmt.allocPrint(arena.allocator(), "-Dfile={s}", .{jar_file}),
         "-DgroupId=com.tigerbeetle",
         "-DartifactId=tigerbeetle-java",
         "-Dpackaging=jar",
