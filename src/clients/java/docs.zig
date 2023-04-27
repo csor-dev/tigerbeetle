@@ -17,7 +17,7 @@ fn find_tigerbeetle_client_jar(arena: *std.heap.ArenaAllocator, root: []const u8
             break;
         } else |err| switch (err) {
             else => {
-                std.debug.print("Could not find jar, rebuilding\.n", .{});
+                std.debug.print("Could not find jar, rebuilding.\n", .{});
                 // target directory doesn't exist, let's try building the Java client.
                 try std.os.chdir("src/clients/java");
                 try run(arena, &[_][]const u8{
